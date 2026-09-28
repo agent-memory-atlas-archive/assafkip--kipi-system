@@ -89,9 +89,23 @@
 		     to 40 while this committed copy still read 12 -- so the ceiling
 		     the founder had set was not the ceiling that ran. 10 is the
 		     founder's number; the drift is the part that made the spend
-		     unbounded, and it is fixed by writing BOTH copies. -->
+		     unbounded, and it is fixed by writing BOTH copies.
+
+		     LOWERED 10 -> 3, founder-approved 2026-09-28 (automation audit,
+		     q-system/output/automation-audit-2026-09-28.md). Idle days were
+		     spending plan usage: 6 issues Sat 26 Sep, 8 Sun 27 Sep, all Opus,
+		     and about half the sana/* branches never land on main. 3 is the
+		     plan's number until the worker moves to cloud sessions. Install
+		     the live copy too (see the unload/load lines above). -->
 		<key>KIPI_DISPATCH_DAILY_MAX</key>
-		<string>10</string>
+		<string>3</string>
+
+		<!-- REVIEWER ON SONNET, founder-approved 2026-09-28 (same audit).
+		     pr-review-agent.sh defaults to claude-opus-5 (its line 144); a
+		     review is content review, which model-allocation.md gives to the
+		     Sonnet tier. Subscription only: every call is claude -p. -->
+		<key>KIPI_REVIEW_CLAUDE_MODEL</key>
+		<string>claude-sonnet-5</string>
 
 		<!-- WHEN THE ALLOWANCE REFILLS, local hour. Founder-set 2026-07-28,
 		     for safety rather than tidiness: a midnight reset hands a full
