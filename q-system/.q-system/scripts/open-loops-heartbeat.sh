@@ -10,6 +10,10 @@
 #   - Writes a structured run-log and self-audits post-sweep (run-step-audit.py).
 # Disable: launchctl unload ~/Library/LaunchAgents/com.kipi.openloops-heartbeat.plist
 set -uo pipefail
+# Subscription only, never the billed API (founder, 2026-09-28): claude prefers
+# ANTHROPIC_API_KEY over the subscription login, so one exported key would turn
+# every unattended run into metered spend. Pinned by test-subscription-only.sh.
+unset ANTHROPIC_API_KEY
 
 # Default the repo root to this script's location (q-system/.q-system/scripts ->
 # three levels up), so the skeleton carries no hardcoded home path. Override

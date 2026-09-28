@@ -84,6 +84,10 @@
 #                            [--engine claude|codex]
 #         --post also comments the review on the PR and the Linear issue.
 set -uo pipefail
+# Subscription only, never the billed API (founder, 2026-09-28): claude prefers
+# ANTHROPIC_API_KEY over the subscription login, so one exported key would turn
+# every unattended run into metered spend. Pinned by test-subscription-only.sh.
+unset ANTHROPIC_API_KEY
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKEL="$(cd "$SCRIPT_DIR/../../.." && pwd)"

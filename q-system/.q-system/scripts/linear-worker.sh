@@ -66,6 +66,10 @@
 # Reproducer for both halves: q-system/.q-system/scripts/test/test-script-stable-under-self-edit.sh
 {
 set -uo pipefail
+# Subscription only, never the billed API (founder, 2026-09-28): claude prefers
+# ANTHROPIC_API_KEY over the subscription login, so one exported key would turn
+# every unattended run into metered spend. Pinned by test-subscription-only.sh.
+unset ANTHROPIC_API_KEY
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # KIPI_SKEL / KIPI_STATE_DIR are TEST-ISOLATION SEAMS, same discipline as
