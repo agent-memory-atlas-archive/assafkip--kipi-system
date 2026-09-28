@@ -2437,6 +2437,16 @@ def _extract_json_object(raw: str) -> dict:
     return json.loads(text[start:end + 1])
 
 
+def _subscription_env():
+    """os.environ without ANTHROPIC_API_KEY, for the headless `claude` call.
+
+    Subscription only, never the billed API (founder, 2026-09-28): claude
+    prefers the key over the subscription login, so an inherited key turns the
+    call into metered spend. Pinned by test-subscription-only.sh (ASK-2176).
+    """
+    return {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
+
+
 def run_judge(packet: dict, *, model: str) -> dict:
     """Run the judge; the `validate_judge_output` validator and its pytest
     cases are the executable blockers on everything this docstring claims.
@@ -2461,7 +2471,7 @@ def run_judge(packet: dict, *, model: str) -> dict:
     for attempt in range(1, JUDGE_MAX_ATTEMPTS + 1):
         try:
             proc = subprocess.run(argv, input=prompt, capture_output=True,
-                                  text=True, timeout=300)
+                                  text=True, timeout=300, env=_subscription_env())
         except (OSError, subprocess.TimeoutExpired) as exc:
             failures.append(f"attempt {attempt}: invocation failed: {exc}")
             continue

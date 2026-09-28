@@ -10,10 +10,6 @@
 #   - Writes a structured run-log and self-audits post-sweep (run-step-audit.py).
 # Disable: launchctl unload ~/Library/LaunchAgents/com.kipi.openloops-heartbeat.plist
 set -uo pipefail
-# Subscription only, never the billed API (founder, 2026-09-28): claude prefers
-# ANTHROPIC_API_KEY over the subscription login, so one exported key would turn
-# every unattended run into metered spend. Pinned by test-subscription-only.sh.
-unset ANTHROPIC_API_KEY
 
 # Default the repo root to this script's location (q-system/.q-system/scripts ->
 # three levels up), so the skeleton carries no hardcoded home path. Override
@@ -168,7 +164,9 @@ work_instance() {
   }
   local agent_tmp="$AGENT_TMP"
   local agent_rc=0
-  ( cd "$path" && KIPI_INSTANCE_NAME="$name" $TO claude -p "$prompt" </dev/null 2>&1 | tee -a "$LOG" > "$agent_tmp" ) || agent_rc=$?
+  # `env -u ANTHROPIC_API_KEY` at the call, not a top-of-file unset a later source
+  # could undo: subscription only, never the billed API (ASK-2176, test-subscription-only.sh).
+  ( cd "$path" && KIPI_INSTANCE_NAME="$name" env -u ANTHROPIC_API_KEY $TO claude -p "$prompt" </dev/null 2>&1 | tee -a "$LOG" > "$agent_tmp" ) || agent_rc=$?
   # Read it out, then delete it, BEFORE either branch decides anything. The
   # classifier below reads $agent_out and never the file, so there is exactly one
   # place the file has to go away and no future branch can be added past it --

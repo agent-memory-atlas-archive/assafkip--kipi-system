@@ -1,55 +1,323 @@
 #!/usr/bin/env bash
 # Subscription only, never the billed API (founder, 2026-09-28: "I don't want to
-# use the API"). Any scheduled script that shells `claude -p` must make it
-# impossible for that call to inherit ANTHROPIC_API_KEY: `claude` prefers the
-# key over the subscription login when both exist, so one exported key in a
-# launchd env turns every unattended run into metered API spend.
+# use the API"). `claude` prefers ANTHROPIC_API_KEY over the subscription login
+# when both exist, so one exported key in a launchd env turns every unattended
+# run into metered API spend. Every headless model call must make inheriting the
+# key impossible AT THE CALL, not somewhere earlier in the file.
 #
-# The rule this pins: a script that invokes `claude -p` either
-#   - unsets the key near its top (`unset ANTHROPIC_API_KEY`), or
-#   - calls claude only through `env -u ANTHROPIC_API_KEY` / the claude_p helper.
-# Comment lines are ignored, so a script that only MENTIONS claude -p passes.
+# WHICH FILES: every file that shells the model on its own. That is the
+# inventory q-system/.q-system/model-call-sites.json (`wrapper` + `shared` +
+# `skeleton` rows whose file is in this tree) UNION what the detector
+# plugins/kipi-core/voiceloop/call_sites.py finds here right now. A hard-coded
+# list missed morning-brief.py and lessons-distill.py (Codex, PR #464 P1); the
+# inventory is already held complete by tests/test_model_call_sites.py.
+#
+# WHAT EACH CALL MUST CARRY:
+#   shell   every non-comment `claude ... -p/--print` command, including one
+#           inside a `bash -c` string, a `$( )` substitution or a string held
+#           in a variable for later execution, has `env -u ANTHROPIC_API_KEY`
+#           in front of the binary in the SAME command. A file-level `unset`
+#           counts for nothing: a later `source` or `export` can put the key
+#           back before the call (Codex, PR #464 P2).
+#   python  the subprocess call whose argv runs the model passes
+#           `env=subscription_env()` (or a name bound to it), the helper returns
+#           os.environ minus the key (proved by CALLING it with the key set),
+#           and no other line in the file names ANTHROPIC_API_KEY (no re-add).
+#           `env=os.environ`, `env=dict(os.environ)` or no env= all fail.
+# Negative controls at the end prove each of those shapes is caught.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
-SCRIPTS="$ROOT/q-system/.q-system/scripts"
-PASS=0; FAIL=0
-ok()  { PASS=$((PASS + 1)); echo "  ok   $1"; }
-bad() { FAIL=$((FAIL + 1)); echo "  FAIL $1"; }
+exec python3 - "$ROOT" <<'PY'
+import ast
+import json
+import os
+import re
+import sys
+from pathlib import Path
 
-# Scheduled entry points that run claude -p (found by the 2026-09-28 sweep).
-TARGETS="kipi-dispatch.sh linear-worker.sh pr-review-agent.sh open-loops-heartbeat.sh hosted-review-gate.sh"
+ROOT = Path(sys.argv[1])
+sys.path.insert(0, str(ROOT / "plugins" / "kipi-core"))
+from voiceloop import call_sites as cs  # noqa: E402
 
-check() {  # check <path>
-  local f="$1" name; name="$(basename "$f")"
-  [ -f "$f" ] || { bad "$name is missing"; return; }
-  if grep -qE '^[[:space:]]*unset([[:space:]]+[A-Z_]+)*[[:space:]]+ANTHROPIC_API_KEY\b' "$f"; then
-    ok "$name unsets ANTHROPIC_API_KEY"; return
-  fi
-  # Every non-comment claude -p call must strip the key itself.
-  local raw
-  raw="$(grep -nE '(^|[^_[:alnum:]])claude"?[[:space:]]+-p\b' "$f" | grep -vE '^[0-9]+:[[:space:]]*#' | grep -vE 'env -u ANTHROPIC_API_KEY|claude_p ' || true)"
-  if [ -n "$raw" ]; then
-    bad "$name can run claude -p on the billed API key: $(echo "$raw" | head -1)"
-  else
-    ok "$name has no claude -p that can inherit the key"
-  fi
+KEY = "ANTHROPIC_API_KEY"
+PASS = FAIL = 0
+
+
+def ok(msg):
+    global PASS
+    PASS += 1
+    print("  ok   " + msg)
+
+
+def bad(msg):
+    global FAIL
+    FAIL += 1
+    print("  FAIL " + msg)
+
+
+# ---------------------------------------------------------------- shell ----
+_NAME_EQ = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# `${VAR-claude -p ...}`: a default command held in a parameter expansion
+# (linear-worker.sh SECOND_RUNNER_FALLBACK), executed later as `$VAR "$1"`.
+_EXPANSION_DEFAULT = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*:?[-=]([^}]*)\}")
+
+
+def _strips(prefix):
+    """Does this command prefix run the binary under `env -u ANTHROPIC_API_KEY`?"""
+    seen_env = False
+    for i, tok in enumerate(prefix):
+        if tok.rsplit("/", 1)[-1] == "env":
+            seen_env = True
+        elif seen_env and tok in ("-u", "--unset") and i + 1 < len(prefix) and prefix[i + 1] == KEY:
+            return True
+        elif seen_env and tok in ("-u" + KEY, "--unset=" + KEY):
+            return True
+    return False
+
+
+def _seg_bad(seg, depth):
+    tokens = cs._tokens(seg)
+    ci = cs._command_index(tokens)
+    out = []
+    if ci >= 0 and cs._BINARY_TOKEN.match(tokens[ci]) \
+            and any(cs._FLAG_TOKEN.match(t) for t in tokens[ci + 1:]) \
+            and not _strips(tokens[:ci]):
+        out.append(seg.strip())
+    # A command string carried as one token: `bash -c "..."`, a quoted case-arm
+    # continuation, or `NAME="... claude -p ..."` executed later.
+    for tok in tokens:
+        body = _NAME_EQ.sub("", tok, count=1)
+        if " " in body and cs._CLAUDE_WORD.search(body):
+            out += _line_bad(body, depth + 1)
+    return out
+
+
+def _line_bad(line, depth=0):
+    if depth > cs._MAX_DEPTH:
+        return []
+    out = []
+    # The default is scanned as a command of its own, then the expansion is
+    # read as the plain variable it evaluates to.
+    for default in _EXPANSION_DEFAULT.findall(line):
+        out += _line_bad(default, depth + 1)
+    line = _EXPANSION_DEFAULT.sub("$_VAR", line)
+    segs = cs._segments(line)
+    if cs._SH_PRINTS.match(line):
+        segs = segs[1:]
+    for seg in segs:
+        out += _seg_bad(seg, depth)
+    for sub in cs._substitutions(line):
+        out += _line_bad(sub, depth + 1)
+    return out
+
+
+def sh_violations(text):
+    out = []
+    for line in cs._logical_lines(text):
+        if line.lstrip().startswith("#"):
+            continue
+        out += _line_bad(line)
+    return out
+
+
+# --------------------------------------------------------------- python ----
+_SUBPROCESS = {"run", "Popen", "check_output", "check_call", "call"}
+
+
+def _argv_list(node):
+    elts = node.elts
+    if elts and cs._is_dash_p(elts[0]) and any(
+            not (isinstance(e, ast.Constant) and isinstance(e.value, str) and e.value.startswith("-"))
+            for e in elts[1:]):
+        return True
+    return any(cs._is_dash_p(elts[i]) and cs._binary_like(elts[i - 1]) for i in range(1, len(elts)))
+
+
+def _assigned(name, scope):
+    for n in ast.walk(scope):
+        if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == name for t in n.targets):
+            yield n.value
+        elif isinstance(n, (ast.AugAssign, ast.AnnAssign)) and isinstance(n.target, ast.Name) \
+                and n.target.id == name and n.value is not None:
+            yield n.value
+
+
+def _model_expr(node, scope, funcs, depth=0):
+    if depth > 6 or node is None:
+        return False
+    rec = lambda n, s=scope: _model_expr(n, s, funcs, depth + 1)  # noqa: E731
+    if isinstance(node, (ast.List, ast.Tuple)):
+        return _argv_list(node)
+    if isinstance(node, ast.BinOp):
+        return rec(node.left) or rec(node.right)
+    if isinstance(node, ast.IfExp):
+        return rec(node.body) or rec(node.orelse)
+    if isinstance(node, ast.BoolOp):
+        return any(rec(v) for v in node.values)
+    if isinstance(node, ast.ListComp):
+        return rec(node.generators[0].iter)
+    if isinstance(node, ast.Name):
+        return any(rec(v) for v in _assigned(node.id, scope))
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in funcs:
+        fn = funcs[node.func.id]
+        return any(rec(r.value, fn) for r in ast.walk(fn) if isinstance(r, ast.Return))
+    return False
+
+
+def _is_helper_call(node):
+    if not isinstance(node, ast.Call):
+        return False
+    f = node.func
+    name = f.id if isinstance(f, ast.Name) else f.attr if isinstance(f, ast.Attribute) else ""
+    return name.endswith("subscription_env")
+
+
+def _env_ok(call, scope):
+    env = next((k.value for k in call.keywords if k.arg == "env"), None)
+    if env is None:
+        return "no env= (inherits os.environ, key included)"
+    if _is_helper_call(env):
+        return None
+    if isinstance(env, ast.Name):
+        vals = list(_assigned(env.id, scope))
+        if vals and all(_is_helper_call(v) for v in vals):
+            return None
+    return "env=%s does not come from subscription_env()" % ast.unparse(env)
+
+
+def _helper_ok(tree, text, path):
+    """The file's subscription_env strips the key when CALLED with it set."""
+    defs = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name.endswith("subscription_env")]
+    imported = any(isinstance(n, ast.ImportFrom) and (n.module or "").endswith("prompt_render")
+                   and any(a.name == "subscription_env" for a in n.names) for n in ast.walk(tree))
+    if not defs and imported:
+        return None
+    if not defs:
+        return "no subscription_env() defined or imported"
+    fn = defs[0]
+    ns = {"os": os}
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), str(path), "exec"), ns)
+    saved = os.environ.get(KEY)
+    os.environ[KEY] = "sk-ant-negative-control"
+    try:
+        got = ns[fn.name]()
+    finally:
+        if saved is None:
+            os.environ.pop(KEY, None)
+        else:
+            os.environ[KEY] = saved
+    if KEY in got or "PATH" not in got:
+        return "%s() does not return os.environ minus %s" % (fn.name, KEY)
+    # No re-add: the key is named only inside the helper.
+    helper_lines = set(range(fn.lineno, fn.end_lineno + 1))
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Constant) and n.value == KEY and n.lineno not in helper_lines:
+            return "line %d names %s outside the helper (a re-add?)" % (n.lineno, KEY)
+    return None
+
+
+def py_violations(text, path="<src>"):
+    tree = ast.parse(text)
+    funcs = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+    scopes = [tree] + list(funcs.values())
+    calls = []
+    for scope in scopes:
+        for n in ast.walk(scope):
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) \
+                    and n.func.attr in _SUBPROCESS and isinstance(n.func.value, ast.Name) \
+                    and n.func.value.id == "subprocess":
+                argv = n.args[0] if n.args else next((k.value for k in n.keywords if k.arg == "args"), None)
+                if _model_expr(argv, scope, funcs):
+                    calls.append((n, scope))
+    # innermost scope wins for a call seen from the module and its function
+    seen, out = {}, []
+    for n, scope in calls:
+        if id(n) not in seen or scope is not tree:
+            seen[id(n)] = (n, scope)
+    if not seen:
+        return ["no model subprocess call recognized (the resolver is blind to this file's shape)"]
+    for n, scope in seen.values():
+        why = _env_ok(n, scope)
+        if why:
+            out.append("line %d: %s" % (n.lineno, why))
+    if not out:
+        why = _helper_ok(tree, text, path)
+        if why:
+            out.append(why)
+    return out
+
+
+# ---------------------------------------------------------------- sites ----
+spec = json.loads((ROOT / "q-system" / ".q-system" / "model-call-sites.json").read_text())
+rows = set(spec.get("wrapper", [])) | set(spec.get("shared", {})) | set(spec.get("skeleton", {}))
+sites = sorted({r for r in rows if (ROOT / r).is_file()} | cs.call_sites(ROOT))
+
+print("subscription-only guard: %d model call sites" % len(sites))
+for rel in sites:
+    text = (ROOT / rel).read_text(errors="replace")
+    v = py_violations(text, rel) if rel.endswith(".py") else sh_violations(text)
+    if v:
+        bad("%s can run claude on the billed API key: %s" % (rel, v[0][:160]))
+        for extra in v[1:]:
+            print("         also: " + extra[:160])
+    else:
+        ok("%s strips %s at every call" % (rel, KEY))
+
+# ------------------------------------------------------ negative controls --
+SH_CONTROLS = {
+    "a bare claude -p": 'claude -p "hi"\n',
+    "unset, then source, then a bare call": 'unset ANTHROPIC_API_KEY\nsource ./env.sh\nclaude -p "hi"\n',
+    "a bare call inside bash -c": 'run_bounded 60 bash -c "cd /x && claude -p \\"$1\\"" _ "$p"\n',
+    "a bare call held in a variable": 'FALLBACK="claude -p --model x"\n',
+    "a bare call in a substitution": 'out="$(claude --print "$p")"\n',
+    "env without -u": 'env FOO=1 claude -p "hi"\n',
+    "a bare call as a parameter-expansion default": 'FB="${OVERRIDE-claude -p --model x}"\n',
 }
+for label, src in SH_CONTROLS.items():
+    if sh_violations(src):
+        ok("negative control caught: shell, %s" % label)
+    else:
+        bad("negative control PASSED: shell, %s" % label)
+if sh_violations('env -u ANTHROPIC_API_KEY claude -p "hi"\n$TO env -u ANTHROPIC_API_KEY "$CLAUDE_BIN" -p x\n'):
+    bad("positive control: env -u ANTHROPIC_API_KEY was not accepted")
+else:
+    ok("positive control: env -u ANTHROPIC_API_KEY claude -p is accepted")
 
-echo "subscription-only guard for scheduled claude -p callers"
-for t in $TARGETS; do
-  case "$t" in
-    kipi-dispatch.sh) check "$ROOT/$t" ;;
-    *) check "$SCRIPTS/$t" ;;
-  esac
-done
+HELPER = ("def subscription_env():\n"
+          "    return {k: v for k, v in os.environ.items() if k != 'ANTHROPIC_API_KEY'}\n")
+PY_CONTROLS = {
+    "no env= at all": 'import subprocess\nsubprocess.run(["claude", "-p", x])\n',
+    "env=os.environ": 'import os, subprocess\nsubprocess.run(["claude", "-p", x], env=os.environ)\n',
+    "env=dict(os.environ)": 'import os, subprocess\nenv = dict(os.environ)\nsubprocess.run(["claude", "-p", x], env=env)\n',
+    "a helper that keeps the key": 'import os, subprocess\ndef subscription_env():\n    return dict(os.environ)\n'
+                                   'subprocess.run(["claude", "-p", x], env=subscription_env())\n',
+    "a re-add after the helper": 'import os, subprocess\n' + HELPER +
+                                 'e = subscription_env()\ne["ANTHROPIC_API_KEY"] = "k"\n'
+                                 'subprocess.run(["claude", "-p", x], env=e)\n',
+}
+for label, src in PY_CONTROLS.items():
+    if py_violations(src):
+        ok("negative control caught: python, %s" % label)
+    else:
+        bad("negative control PASSED: python, %s" % label)
+good = 'import os, subprocess\n' + HELPER + 'subprocess.run(["claude", "-p", x], env=subscription_env())\n'
+if py_violations(good):
+    bad("positive control: env=subscription_env() was not accepted: %s" % py_violations(good))
+else:
+    ok("positive control: env=subscription_env() is accepted")
 
-# Negative control: a script with a bare call must be caught.
-CTRL="$(mktemp)"; trap 'rm -f "$CTRL"' EXIT
-printf '#!/bin/bash\nclaude -p "hi"\n' > "$CTRL"
-out="$(FAIL=0; check "$CTRL" 2>&1)"
-case "$out" in *FAIL*) ok "negative control: a bare claude -p is caught" ;; *) bad "negative control passed a bare claude -p" ;; esac
+# The wrapper's own helper, imported the way a caller would.
+try:
+    from voiceloop import prompt_render
+    os.environ[KEY] = "sk-ant-negative-control"
+    got = prompt_render.subscription_env()
+    os.environ.pop(KEY, None)
+    (ok if KEY not in got else bad)("prompt_render.subscription_env() drops %s" % KEY)
+except Exception as exc:  # noqa: BLE001
+    bad("prompt_render.subscription_env() unavailable: %s" % exc)
 
-echo
-echo "passed $PASS, failed $FAIL"
-[ "$PASS" -gt 0 ] && [ "$FAIL" = 0 ]
+print()
+print("passed %d, failed %d" % (PASS, FAIL))
+sys.exit(0 if PASS > 0 and FAIL == 0 else 1)
+PY
