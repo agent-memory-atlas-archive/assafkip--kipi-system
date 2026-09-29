@@ -319,8 +319,17 @@ for name, path in instance_roots():
         if rows:
             not_checked.append((_key(name), len(rows)))
         continue
+    waived = spec.get("api_by_design", {}).get(_key(name), {})
     for rel, v in instance_violations(path):
         label = "instance %s file %s" % (_key(name), _key(rel))
+        if _key(rel) in waived:
+            # A founder-recorded exception waives only the names-the-key check;
+            # an unstripped model call in the same file still fails.
+            v = [x for x in v if "outside the helper" not in x]
+            if not v:
+                ok("%s: API path kept by founder decision (api_by_design); every claude call strips %s"
+                   % (label, KEY))
+                continue
         if v:
             bad("%s can run claude on the billed API key: %s" % (label, v[0][:160]))
         else:
