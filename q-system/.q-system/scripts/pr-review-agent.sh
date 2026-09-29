@@ -905,8 +905,10 @@ run_engine() {   # run_engine <claude|codex> <destination-file>
     # forces one more turn, and that turn's text replaces the verdict. Measured on a
     # week of real transcripts: reviewer verdicts say "does not exist" routinely
     # ("cites a backstop that does not exist"). The lint still logs them advisory.
+    # `env -u ANTHROPIC_API_KEY` at the call, not a top-of-file unset a later source
+    # could undo: subscription only, never the billed API (ASK-2176, test-subscription-only.sh).
     claude) KIPI_BLOCKED_CLAIM_LINT_MODE=advisory run_bounded "$TIMEOUT_SECONDS" bash -c \
-              "cd '$REVIEW_ROOT' && claude -p --model '$CLAUDE_MODEL' \"\$1\" </dev/null > '$2' 2>&1" _ "$PROMPT" ;;
+              "cd '$REVIEW_ROOT' && env -u ANTHROPIC_API_KEY claude -p --model '$CLAUDE_MODEL' \"\$1\" </dev/null > '$2' 2>&1" _ "$PROMPT" ;;
     codex)  run_bounded "$TIMEOUT_SECONDS" bash -c \
               "codex exec --ignore-user-config --skip-git-repo-check --model '$CODEX_MODEL' -C '$REVIEW_ROOT' \"\$1\" </dev/null > '$2' 2>&1" _ "$PROMPT" ;;
   esac
