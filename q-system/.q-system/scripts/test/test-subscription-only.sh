@@ -11,6 +11,9 @@
 # plugins/kipi-core/voiceloop/call_sites.py finds here right now. A hard-coded
 # list missed morning-brief.py and lessons-distill.py (Codex, PR #464 P1); the
 # inventory is already held complete by tests/test_model_call_sites.py.
+# PLUS every instance-local caller in each registered instance checked out on
+# this machine (the `instances` rows; codex major, PR #464 round 3), labelled by
+# hash because this repo is public. One not checked out here prints NOT CHECKED.
 #
 # WHAT EACH CALL MUST CARRY:
 #   shell   every non-comment `claude ... -p/--print` command, including one
@@ -269,6 +272,63 @@ for rel in sites:
     else:
         ok("%s strips %s at every call" % (rel, KEY))
 
+# ------------------------------------------------------------ instances ----
+# Codex major, PR #464 round 3: the rows above are this tree only, so the 41
+# inventoried instance-local callers (model-call-sites.json `instances`) were
+# never read and the guard said green while scheduled instance jobs could still
+# inherit the key. Every registered instance checked out on this machine is now
+# scanned with the same checkers. Labels are hashes, never paths or names: this
+# repo is public and a review run posts this output to the PR. The real path of a
+# hash prints with `python3 q-system/.q-system/tests/test_model_call_sites.py`.
+# An instance not checked out here (CI, a cloud session) is NOT CHECKED, counted
+# and printed, never counted as a pass.
+import hashlib  # noqa: E402
+
+
+def _key(s):
+    return hashlib.sha256(s.encode()).hexdigest()[:12]
+
+
+def instance_roots():
+    """(name, path or None) per registry instance. KIPI_INSTANCE_PATHS is a JSON
+    {name: path} override for a clone that lives elsewhere (tests, a cloud session)."""
+    reg = json.loads((ROOT / "instance-registry.json").read_text())
+    moved = json.loads(os.environ.get("KIPI_INSTANCE_PATHS") or "{}")
+    for it in reg.get("instances", []):
+        p = Path(os.path.expanduser(str(moved.get(it["name"], it.get("path", "")))))
+        yield it["name"], (p if it.get("has_git") and (p / ".git").exists() else None)
+
+
+def instance_sites(path):
+    return sorted(r for r in cs.call_sites(path) - set(spec.get("wrapper", []))
+                  if not r.startswith(("q-system/", "plugins/")))
+
+
+def instance_violations(path):
+    """(rel, first violation or None) for every instance-local model caller under path."""
+    for rel in instance_sites(path):
+        text = (path / rel).read_text(errors="replace")
+        v = py_violations(text, rel) if rel.endswith(".py") else sh_violations(text)
+        yield rel, v
+
+
+not_checked = []
+for name, path in instance_roots():
+    rows = spec.get("instances", {}).get(_key(name), {})
+    if path is None:
+        if rows:
+            not_checked.append((_key(name), len(rows)))
+        continue
+    for rel, v in instance_violations(path):
+        label = "instance %s file %s" % (_key(name), _key(rel))
+        if v:
+            bad("%s can run claude on the billed API key: %s" % (label, v[0][:160]))
+        else:
+            ok("%s strips %s at every call" % (label, KEY))
+NOT_CHECKED = sum(n for _, n in not_checked)
+for h, n in not_checked:
+    print("  NOT CHECKED instance %s: %d inventoried caller(s), no checkout on this machine" % (h, n))
+
 # ------------------------------------------------------ negative controls --
 SH_CONTROLS = {
     "a bare claude -p": 'claude -p "hi"\n',
@@ -314,6 +374,26 @@ if py_violations(good):
 else:
     ok("positive control: env=subscription_env() is accepted")
 
+# An instance checkout is really read: a bare call in a throwaway repo is caught,
+# and the same file stripped at the call passes.
+import subprocess as _sp  # noqa: E402
+import tempfile  # noqa: E402
+with tempfile.TemporaryDirectory() as _tmp:
+    _t = Path(_tmp)
+    _sp.run(["git", "init", "-q", str(_t)], check=True)
+    (_t / "job.py").write_text('import subprocess\nsubprocess.run(["claude", "-p", "hi"])\n')
+    (_t / "ok.sh").write_text('env -u ANTHROPIC_API_KEY claude -p "hi"\n')
+    _sp.run(["git", "-C", str(_t), "add", "-A"], check=True)
+    _found = dict(instance_violations(_t))
+    if _found.get("job.py"):
+        ok("negative control caught: an instance-local bare call")
+    else:
+        bad("negative control PASSED: an instance-local bare call (instance scan is blind)")
+    if "ok.sh" in _found and not _found["ok.sh"]:
+        ok("positive control: an instance-local stripped call is accepted")
+    else:
+        bad("positive control: instance-local stripped call: %r" % (_found.get("ok.sh"),))
+
 # The wrapper's own helper, imported the way a caller would.
 try:
     from voiceloop import prompt_render
@@ -325,6 +405,6 @@ except Exception as exc:  # noqa: BLE001
     bad("prompt_render.subscription_env() unavailable: %s" % exc)
 
 print()
-print("passed %d, failed %d" % (PASS, FAIL))
+print("passed %d, failed %d, NOT CHECKED %d instance caller(s)" % (PASS, FAIL, NOT_CHECKED))
 sys.exit(0 if PASS > 0 and FAIL == 0 else 1)
 PY

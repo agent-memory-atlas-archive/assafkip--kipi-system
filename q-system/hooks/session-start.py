@@ -230,14 +230,16 @@ NOTES_PUBLISH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 
 def overlay_notes(project_dir):
-    """Cloud sessions: pull newer notes from origin's kipi/notes into the tree.
+    """Pull notes from origin's kipi/notes that supersede the local copy.
 
     why (codex major, PR #464): auto-commit publishes notes to kipi/notes, but
     nothing here read that branch, so a cloud session on an instance repo still
     loaded the stale default-branch handoff. notes-publish.py --overlay owns the
-    allowlist and the newer-than rule; it is a silent no-op outside a remote
-    session, never stages or commits. Non-fatal and bounded: the hook's own cap
-    is 5s, so this gives it 4 and prints its single line.
+    allowlist and the lineage rule; it runs in every session since round 3 (a
+    Mac that never reads the branch would keep-conflict forever) and is silent
+    locally unless it overlaid something; it never stages or commits.
+    Non-fatal and bounded: the hook's own cap is 5s, so this gives it 4 and
+    prints its single line.
     """
     import subprocess
     script = os.path.normpath(NOTES_PUBLISH)

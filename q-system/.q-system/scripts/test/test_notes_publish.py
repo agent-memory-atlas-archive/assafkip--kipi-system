@@ -80,6 +80,14 @@ def remote_tree(bare):
     return sorted(git(bare, "ls-tree", "-r", "--name-only", BRANCH).stdout.split())
 
 
+LINEAGE = ".kipi-notes-lineage.json"
+
+
+def notes_tree(bare):
+    """The notes paths on kipi/notes, without the lineage manifest."""
+    return [p for p in remote_tree(bare) if p != LINEAGE]
+
+
 def commit_count(bare):
     return int(git(bare, "rev-list", "--count", BRANCH).stdout.strip())
 
@@ -180,7 +188,8 @@ def test_one_commit_with_only_notes_and_the_checkout_untouched(tmp_path):
     before = snapshot(root)
     r = publish(root)
     assert r.returncode == 0, r.stderr
-    assert remote_tree(bare) == EXPECTED, r.stdout
+    assert notes_tree(bare) == EXPECTED, r.stdout
+    assert LINEAGE in remote_tree(bare)
     assert commit_count(bare) == 1
     msg = git(bare, "log", "-1", "--format=%B", BRANCH).stdout
     assert "[skip ci]" in msg
@@ -213,7 +222,7 @@ def test_code_never_lands_in_kipi_notes(tmp_path):
     git(root, "add", "q-ps/pipeline/code.py", "src/app.js")
     git(root, "commit", "-q", "-m", "code")
     publish(root)
-    tree = remote_tree(bare)
+    tree = notes_tree(bare)
     assert tree == EXPECTED
     assert not any(p.endswith((".py", ".js")) for p in tree)
 
@@ -318,7 +327,7 @@ def test_skeleton_rcas_land_in_consulting_and_nothing_in_the_skeleton(tmp_path):
 
     lines = mod.run(str(skel), visibility=vis)
     assert remote_tip(skel_bare) is None, lines
-    assert remote_tree(cons_bare) == ["kipi-system/output/rca/rca-skel-2026-09-28.md"], lines
+    assert notes_tree(cons_bare) == ["kipi-system/output/rca/rca-skel-2026-09-28.md"], lines
     assert snapshot(cons) == cons_before
 
     # And a consulting origin that is not provably private gets nothing either.
@@ -395,8 +404,19 @@ def commit_at(root, when, msg, *paths):
     assert r.returncode == 0, r.stderr
 
 
-def push_notes_at(tmp_path, bare, when, files):
-    """Put `files` on the remote kipi/notes as one commit dated `when`."""
+def blob(body):
+    return hashlib.sha1(b"blob %d\0" % len(body.encode()) + body.encode()).hexdigest()
+
+
+def push_notes_at(tmp_path, bare, when, files, supersedes=None):
+    """Put `files` on the remote kipi/notes as one commit dated `when`.
+
+    `supersedes` {path: [bodies]} writes the lineage a real publisher leaves: the
+    versions the branch copy replaced. Without it the branch copy has no lineage,
+    which is what an independent edit on another machine looks like."""
+    if supersedes:
+        files = dict(files, **{LINEAGE: json.dumps(
+            {p: [blob(b) for b in bodies] + [blob(files[p])] for p, bodies in supersedes.items()})})
     pub = tmp_path / "publisher"
     git(tmp_path, "clone", "-q", str(bare), str(pub))
     git(pub, "config", "user.email", "t@t.t")
@@ -429,7 +449,8 @@ def test_remote_session_overlays_a_newer_handoff_from_kipi_notes(tmp_path):
     clone = cloud_clone(tmp_path, bare, "2026-01-01T00:00:00+0000")
     push_notes_at(tmp_path, bare, "2026-09-01T00:00:00+0000",
                   {HANDOFF_PATH: "fresh handoff\n",
-                   "q-ps/output/rca/rca-x-2026-09-01.md": "# RCA\n"})
+                   "q-ps/output/rca/rca-x-2026-09-01.md": "# RCA\n"},
+                  supersedes={HANDOFF_PATH: ["stale handoff\n"]})
     index_before = (clone / ".git" / "index").read_bytes()
     head_before = git(clone, "rev-parse", "HEAD").stdout
     r = overlay(clone)
@@ -464,7 +485,19 @@ def test_uncommitted_local_edits_are_never_overwritten(tmp_path):
     assert (clone / HANDOFF_PATH).read_text() == "work in progress\n"
 
 
-def test_non_remote_session_is_a_no_op(tmp_path):
+def test_a_branch_copy_with_no_lineage_is_not_overlaid(tmp_path):
+    """Control for round 3: a newer COMMIT DATE alone proves nothing. The branch
+    copy never superseded this checkout's copy, so the local one stays."""
+    bare = tmp_path / "remote.git"
+    git(tmp_path, "init", "-q", "--bare", str(bare))
+    clone = cloud_clone(tmp_path, bare, "2026-01-01T00:00:00+0000")
+    push_notes_at(tmp_path, bare, "2026-09-01T00:00:00+0000", {HANDOFF_PATH: "fresh\n"})
+    r = overlay(clone)
+    assert (clone / HANDOFF_PATH).read_text() == "stale handoff\n", r.stdout
+
+
+def test_a_local_session_overlays_only_what_supersedes_and_is_otherwise_silent(tmp_path):
+    """Round 3: the Mac overlays too, or it could never learn a cloud edit."""
     bare = tmp_path / "remote.git"
     git(tmp_path, "init", "-q", "--bare", str(bare))
     clone = cloud_clone(tmp_path, bare, "2026-01-01T00:00:00+0000")
@@ -473,6 +506,14 @@ def test_non_remote_session_is_a_no_op(tmp_path):
     assert r.returncode == 0
     assert (clone / HANDOFF_PATH).read_text() == "stale handoff\n"
     assert r.stdout.strip() == ""
+    git(tmp_path / "publisher", "checkout", "-q", "kipi/notes")
+    write(tmp_path / "publisher", LINEAGE,
+          json.dumps({HANDOFF_PATH: [blob("stale handoff\n"), blob("fresh\n")]}))
+    commit_at(tmp_path / "publisher", "2026-09-02T00:00:00+0000", "lineage", LINEAGE)
+    git(tmp_path / "publisher", "push", "-q", "origin", "HEAD:refs/heads/kipi/notes")
+    r = overlay(clone, remote=False)
+    assert (clone / HANDOFF_PATH).read_text() == "fresh\n", r.stdout
+    assert "overlaid 1" in r.stdout
 
 
 def test_overlay_never_writes_a_code_file_from_the_branch(tmp_path):
@@ -482,7 +523,8 @@ def test_overlay_never_writes_a_code_file_from_the_branch(tmp_path):
     clone = cloud_clone(tmp_path, bare, "2026-01-01T00:00:00+0000")
     push_notes_at(tmp_path, bare, "2026-09-01T00:00:00+0000",
                   {HANDOFF_PATH: "fresh\n", "q-ps/pipeline/code.py": "print('x')\n",
-                   "src/app.js": "x\n", "README.md": "overwritten\n"})
+                   "src/app.js": "x\n", "README.md": "overwritten\n"},
+                  supersedes={HANDOFF_PATH: ["stale handoff\n"]})
     r = overlay(clone)
     assert (clone / HANDOFF_PATH).read_text() == "fresh\n", r.stdout
     assert not (clone / "q-ps/pipeline/code.py").exists()
@@ -508,11 +550,12 @@ def test_session_start_runs_the_overlay_before_loading_the_handoff():
     assert "timeout=" in src[src.index("def overlay_notes"):]
 
 
-# --- round 2 (codex, #464): newer wins per path, deletions propagate --------
+# --- rounds 2-3 (codex, #464): per path, by lineage; deletions propagate ----
 #
-# Every decision is per path, on history: the local side's last commit touching
-# the path (an uncommitted edit counts as committed now, because auto-commit runs
-# before publish) against kipi/notes' last commit touching it.
+# Round 2 decided by commit dates, which come from unrelated histories (round 3).
+# Every decision is now by content: a publisher replaces the branch copy only when
+# it has SEEN that copy (local history or its own record), and the branch's
+# lineage says which versions its copy already superseded.
 
 ACTIVE = "q-ps/.active-case"
 
@@ -527,7 +570,8 @@ def test_an_older_local_handoff_does_not_replace_a_newer_remote_one(tmp_path):
     root, bare = make_repo(tmp_path)
     write(root, HANDOFF_PATH, "old local\n")
     commit_at(root, "2026-01-01T00:00:00+0000", "old handoff", HANDOFF_PATH)
-    push_notes_at(tmp_path, bare, "2026-09-01T00:00:00+0000", {HANDOFF_PATH: "newer remote\n"})
+    push_notes_at(tmp_path, bare, "2026-09-01T00:00:00+0000", {HANDOFF_PATH: "newer remote\n"},
+                  supersedes={HANDOFF_PATH: ["old local\n"]})
     r = publish(root)
     assert r.returncode == 0, r.stderr
     assert notes_body(bare, HANDOFF_PATH) == "newer remote\n", r.stdout
@@ -537,6 +581,8 @@ def test_an_older_local_handoff_does_not_replace_a_newer_remote_one(tmp_path):
 
 def test_a_newer_local_handoff_replaces_the_remote_one(tmp_path):
     root, bare = make_repo(tmp_path)
+    write(root, HANDOFF_PATH, "older remote\n")          # this checkout saw the branch copy
+    commit_at(root, "2026-09-01T00:00:00+0000", "synced", HANDOFF_PATH)
     write(root, HANDOFF_PATH, "new local\n")
     commit_at(root, "2026-09-20T00:00:00+0000", "new handoff", HANDOFF_PATH)
     push_notes_at(tmp_path, bare, "2026-09-01T00:00:00+0000", {HANDOFF_PATH: "older remote\n"})
@@ -558,6 +604,63 @@ def test_two_racing_publishers_the_stale_one_keeps_the_fresh_content(tmp_path):
     r = publish(b)                                   # b still holds the stale copy
     assert notes_body(bare, HANDOFF_PATH) == "fresh from a\n", r.stdout
     assert "kept-newer-remote" in r.stdout
+
+
+def test_a_stale_session_committing_later_never_overwrites_a_fresher_handoff(tmp_path):
+    """RED on 74ca51c7 (codex round 3, #464): b branched from the stale copy,
+    never saw a's fresh one, and committed its own edit LATER. The commit-date
+    rule let b overwrite a. By lineage b never saw a's copy: it is kept."""
+    a, bare = make_repo(tmp_path, "a")
+    write(a, HANDOFF_PATH, "stale\n")
+    commit_at(a, "2026-01-01T00:00:00+0000", "stale handoff", HANDOFF_PATH)
+    git(a, "push", "-q", "origin", "work")
+    b = tmp_path / "b"
+    git(tmp_path, "clone", "-q", "-b", "work", str(bare), str(b))
+    git(b, "config", "user.email", "t@t.t")
+    git(b, "config", "user.name", "t")
+    write(a, HANDOFF_PATH, "fresh from a\n")
+    commit_at(a, "2026-09-01T00:00:00+0000", "fresh handoff", HANDOFF_PATH)
+    assert "published" in publish(a).stdout
+    write(b, HANDOFF_PATH, "b's edit on the stale base\n")
+    commit_at(b, "2026-09-30T00:00:00+0000", "later commit on a stale base", HANDOFF_PATH)
+    r = publish(b)
+    assert notes_body(bare, HANDOFF_PATH) == "fresh from a\n", r.stdout
+    assert "kept-conflict" in r.stdout and HANDOFF_PATH in r.stdout, r.stdout
+
+
+def test_two_machines_converge_through_the_overlay(tmp_path):
+    """The Mac publishes, a cloud session overlays and edits, the Mac overlays
+    and edits again: every hop is a fast-forward, so each one publishes."""
+    mac, bare = make_repo(tmp_path, "mac")
+    write(mac, HANDOFF_PATH, "v1 mac\n")
+    commit_at(mac, "2026-09-01T00:00:00+0000", "v1", HANDOFF_PATH)
+    git(mac, "push", "-q", "origin", "work")
+    assert "published" in publish(mac).stdout
+    cloud = tmp_path / "cloud"
+    git(tmp_path, "clone", "-q", "-b", "work", str(bare), str(cloud))
+    git(cloud, "config", "user.email", "t@t.t")
+    git(cloud, "config", "user.name", "t")
+    write(cloud, HANDOFF_PATH, "v2 cloud\n")
+    commit_at(cloud, "2026-09-02T00:00:00+0000", "v2", HANDOFF_PATH)
+    assert "published 1" in publish(cloud).stdout
+    r = overlay(mac, remote=False)
+    assert (mac / HANDOFF_PATH).read_text() == "v2 cloud\n", r.stdout
+    commit_at(mac, "2026-09-03T00:00:00+0000", "overlaid", HANDOFF_PATH)
+    write(mac, HANDOFF_PATH, "v3 mac\n")
+    commit_at(mac, "2026-09-04T00:00:00+0000", "v3", HANDOFF_PATH)
+    r = publish(mac)
+    assert notes_body(bare, HANDOFF_PATH) == "v3 mac\n", r.stdout
+
+
+def test_an_untracked_rca_edit_replaces_the_copy_this_checkout_published(tmp_path):
+    """Ignored RCAs have no history: the publisher's own record is what it saw."""
+    root, bare = make_repo(tmp_path)
+    rca = "q-ps/output/rca/rca-y-2026-09-28.md"
+    write(root, rca, "# v1\n")
+    assert "published 1" in publish(root).stdout
+    write(root, rca, "# v2\n")
+    r = publish(root)
+    assert notes_body(bare, rca) == "# v2\n", r.stdout
 
 
 def _closed_case(tmp_path, deleted_at="2026-09-10T00:00:00+0000"):
@@ -584,10 +687,17 @@ def test_closing_active_case_locally_removes_it_from_kipi_notes(tmp_path):
     assert "removed 1" in r.stdout and ACTIVE in r.stdout, r.stdout
 
 
-def test_a_deletion_older_than_the_remote_copy_does_not_remove_it(tmp_path):
-    root, bare = _closed_case(tmp_path, deleted_at="2026-08-15T00:00:00+0000")
-    publish(root)
-    assert ACTIVE in remote_tree(bare)
+def test_a_deletion_never_removes_a_branch_copy_this_checkout_never_saw(tmp_path):
+    """Another machine reopened a case after this one closed case-001: the close
+    is about case-001, never about a copy it did not see."""
+    root, bare = _closed_case(tmp_path)
+    pub = tmp_path / "publisher"
+    git(pub, "checkout", "-q", "kipi/notes")
+    write(pub, ACTIVE, "case-002\n")
+    commit_at(pub, "2026-08-15T00:00:00+0000", "reopened elsewhere", ACTIVE)
+    git(pub, "push", "-q", "origin", "HEAD:refs/heads/kipi/notes")
+    r = publish(root)
+    assert ACTIVE in remote_tree(bare), r.stdout
 
 
 def test_a_cloud_overlay_after_the_close_does_not_resurrect_the_case(tmp_path):

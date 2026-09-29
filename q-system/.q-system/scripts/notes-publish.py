@@ -21,22 +21,27 @@ update-index --cacheinfo, write-tree, commit-tree, push <sha>:refs/heads/kipi/no
     as instance-automation-guard) the repo is public, so its RCAs go to the
     consulting checkout's `kipi/notes` under `kipi-system/output/rca/` and its
     own handoff is published nowhere (founder choice b, 2026-09-28);
-  - per path, NEWER WINS (codex round 2, #464): a local file replaces the
-    kipi/notes entry only when its last local commit (an uncommitted edit counts
-    as now; a never-committed file uses its mtime) is newer than kipi/notes' last
-    commit touching that path, or the path is absent there; otherwise the entry
-    is kept and reported `kept-newer-remote`. A notes path deleted locally AFTER
-    kipi/notes' copy is removed from the branch (instance mode only);
+  - per path, BY LINEAGE, never by clocks (codex rounds 2-3, #464): a local file
+    replaces the kipi/notes entry only when this checkout has SEEN that entry
+    (its git history of the path, or its own record in the git dir of what it
+    published or overlaid), or the path is absent there. Otherwise the entry is
+    kept: `kept-newer-remote` when the branch's lineage (.kipi-notes-lineage.json,
+    the versions each copy superseded) already holds the local copy,
+    `kept-conflict` when both sides changed independently. A notes path deleted
+    locally is removed from the branch only while the branch still holds a copy
+    this checkout saw (instance mode only);
   - no change -> no commit; a rejected push (race) is refetched, rebuilt and
     retried once, then logged and dropped. Commits end `[skip ci]`.
 
 `--overlay` is the READ side (codex major on #464: the branch had no consumer, so
-a cloud session still loaded the stale default-branch handoff). Only when
-CLAUDE_CODE_REMOTE is true (the cloud session runtime sets it; injectable for tests)
-and origin has kipi/notes: fetch it and write each allowlisted notes file into the
-working tree when its last kipi/notes commit is newer than the local file's last
-commit, or the local file is absent and was not deleted locally after that copy. It never writes a code path, never stages or
-commits, never overwrites uncommitted local edits or writes through a symlink.
+a cloud session still loaded the stale default-branch handoff). It runs in every
+session: fetch kipi/notes and write each allowlisted notes file whose branch copy
+supersedes the local one, meaning the local content is already in the branch's
+lineage (so nothing local is lost), or the local file is absent and this checkout
+never saw that copy before deleting it. Round 3 made the Mac run it too: a checkout
+that only publishes never learns another machine's copy and would keep-conflict
+forever. It never writes a code path, never stages or commits, never writes through
+a symlink; a local session prints only when it overlaid something.
 Called from q-system/hooks/session-start.py before the handoff is loaded.
 
 Called non-fatally at the end of auto-commit.py's main(). Always exits 0; every
@@ -183,40 +188,88 @@ def _last(stderr: str) -> str:
     return lines[-1] if lines else "no error text"
 
 
-def _ct(g: _Git, *args) -> float | None:
-    """Commit time (epoch s) of the last commit `git log` selects, or None."""
-    out = g("log", "-1", "--format=%ct", *args, timeout=10).stdout.strip()
-    return float(out) if out else None
+LINEAGE = ".kipi-notes-lineage.json"   # on kipi/notes only; never a notes path, never overlaid
+LINEAGE_CAP = 200                       # versions kept per path, newest last
+SEEN_FILE = "kipi-notes-seen.json"      # under this checkout's git dir, never committed
+
+
+def _parse_json(text: str) -> dict:
+    try:
+        val = json.loads(text)
+    except ValueError:
+        return {}
+    return val if isinstance(val, dict) else {}
+
+
+def _cap(shas) -> list:
+    out = []
+    for sha in shas:
+        if sha in out:
+            out.remove(sha)
+        out.append(sha)
+    return out[-LINEAGE_CAP:]
+
+
+def _lineage(g: _Git, commit) -> dict:
+    """path -> every blob kipi/notes' copy of that path has superseded or holds."""
+    if not commit:
+        return {}
+    r = g("show", f"{commit}:{LINEAGE}", timeout=10)
+    return _parse_json(r.stdout) if r.returncode == 0 else {}
 
 
 class _History:
-    """The LOCAL side of every per-path decision (codex round 2, #464).
+    """What THIS checkout has seen of each notes path (codex round 3, #464).
 
-    why: publish used to replace every remote entry with whatever file was on
-    disk, so a stale clone publishing after a fresh one overwrote the newer
-    handoff and still said "published"; and a deleted state file stayed on
-    kipi/notes forever, so an overlay resurrected a closed .active-case.
+    why: round 2 compared the local file's commit time with kipi/notes' commit
+    time. Those clocks come from unrelated histories, so a stale session that
+    committed later still overwrote the fresher handoff. Decisions are now by
+    content lineage: a checkout replaces the branch copy only when it has seen
+    that exact copy (in its git history, or recorded here when it published or
+    overlaid it), and the branch carries LINEAGE so a reader can tell whether its
+    own copy was already superseded. Timestamps decide nothing.
     """
 
     def __init__(self, repo: Path, tracks_deletions: bool):
         self.repo, self.g, self.tracks_deletions = repo, _Git(repo), tracks_deletions
+        self._rec = None
 
-    def stamp(self, src: Path) -> float:
-        """When the local copy of this file was last committed."""
-        rel = src.relative_to(self.repo).as_posix()
-        if self.g("ls-files", "--error-unmatch", "--", rel, timeout=10).returncode != 0:
-            return src.stat().st_mtime      # never committed (ignored RCAs): its mtime
-        if self.g("diff", "--quiet", "HEAD", "--", rel, timeout=10).returncode != 0:
-            # auto-commit.py runs BEFORE publish, so an edit still uncommitted
-            # here is the freshest copy there is: treat it as committed now.
-            return time.time()
-        return _ct(self.g, "HEAD", "--", rel) or time.time()
+    def _rec_path(self) -> Path:
+        p = self.g("rev-parse", "--git-path", SEEN_FILE, timeout=10).stdout.strip()
+        return Path(p) if os.path.isabs(p) else self.repo / p
 
-    def deleted_at(self, rel: str) -> float | None:
-        """When this path was last deleted in local history, or None."""
-        if not self.tracks_deletions:
-            return None
-        return _ct(self.g, "--diff-filter=D", "HEAD", "--", rel)
+    def _record(self) -> dict:
+        if self._rec is None:
+            try:
+                self._rec = _parse_json(self._rec_path().read_text())
+            except OSError:
+                self._rec = {}
+        return self._rec
+
+    def versions(self, rel: str) -> list:
+        """Every blob `rel` has held in local history, oldest first."""
+        out = self.g("log", "--reverse", "-m", "--format=", "--raw", "--no-abbrev",
+                     "HEAD", "--", rel, timeout=10).stdout
+        shas = []
+        for line in out.splitlines():
+            if line.startswith(":"):
+                shas += [s for s in line.split("\t", 1)[0].split()[2:4] if s.strip("0")]
+        return _cap(shas)
+
+    def seen(self, tree_path: str, rel: str) -> set:
+        return set(self.versions(rel)) | set(self._record().get(tree_path, []))
+
+    def remember(self, tree_path: str, sha: str) -> None:
+        rec = self._record()
+        rec[tree_path] = _cap(list(rec.get(tree_path, [])) + [sha])
+
+    def save(self) -> None:
+        if self._rec is None:
+            return
+        p = self._rec_path()
+        tmp = p.with_name(p.name + ".tmp")
+        tmp.write_text(json.dumps(self._rec, indent=1, sort_keys=True) + "\n")
+        os.replace(tmp, p)
 
 
 def _entries(g: _Git, commit) -> dict:
@@ -231,43 +284,69 @@ def _entries(g: _Git, commit) -> dict:
     return out
 
 
-def _stage_notes(gi: _Git, parent, files: dict, history: _History):
-    """Newer wins per path; deletions newer than the remote copy propagate.
+def _hash_bytes(g: _Git, data: bytes) -> str:
+    with tempfile.NamedTemporaryFile(delete=False) as fh:
+        fh.write(data)
+    try:
+        return g("hash-object", "-w", "--no-filters", fh.name).stdout.strip()
+    finally:
+        os.unlink(fh.name)
 
-    Returns (written, kept, removed, error). Only `written`/`removed` changed the tree.
+
+def _stage_notes(gi: _Git, parent, files: dict, history: _History) -> dict:
+    """Per path: replace the branch copy only when this checkout has seen it.
+
+    A branch copy this checkout never saw is kept: `kept-newer-remote` when the
+    branch already superseded the local copy (it is in LINEAGE), `kept-conflict`
+    when both sides changed independently. A deletion propagates only when the
+    branch still holds a version this checkout saw before deleting it.
+    Returns {written, kept, conflict, removed, remember, error}.
     """
-    entries = _entries(gi, parent)
-    written, kept, removed = [], [], []
+    entries, lineage = _entries(gi, parent), _lineage(gi, parent)
+    res = {"written": [], "kept": [], "conflict": [], "removed": [], "remember": [], "error": None}
     for path, src in sorted(files.items()):
         if not is_notes_path(path):          # belt and braces: never code
             continue
         h = gi("hash-object", "-w", "--no-filters", str(src))
         if h.returncode != 0:
-            return written, kept, removed, f"hash-object failed for {path} ({_last(h.stderr)})"
-        sha = h.stdout.strip()
-        if entries.get(path) == sha:
+            res["error"] = f"hash-object failed for {path} ({_last(h.stderr)})"
+            return res
+        sha, remote = h.stdout.strip(), entries.get(path)
+        res["remember"].append((path, sha))
+        if remote == sha:
             continue
-        if path in entries:
-            remote_ct = _ct(gi, parent, "--", path)
-            if remote_ct is not None and history.stamp(src) <= remote_ct:
-                kept.append(path)            # the remote copy is newer: never replace it
-                continue
+        rel = src.relative_to(history.repo).as_posix()
+        if remote is not None and remote not in history.seen(path, rel):
+            res["kept" if sha in lineage.get(path, ()) else "conflict"].append(path)
+            continue
         u = gi("update-index", "--add", "--cacheinfo", f"100644,{sha},{path}")
         if u.returncode != 0:
-            return written, kept, removed, f"update-index failed for {path} ({_last(u.stderr)})"
-        written.append(path)
+            res["error"] = f"update-index failed for {path} ({_last(u.stderr)})"
+            return res
+        lineage[path] = _cap(list(lineage.get(path, [])) + ([remote] if remote else [])
+                             + history.versions(rel) + [sha])
+        res["written"].append(path)
     for path in sorted(set(entries) - set(files)):
-        if not is_notes_path(path) or path.startswith(SKELETON_PREFIX):
+        if not is_notes_path(path) or path.startswith(SKELETON_PREFIX) or not history.tracks_deletions:
             continue
-        gone, remote_ct = history.deleted_at(path), _ct(gi, parent, "--", path)
-        if gone is not None and remote_ct is not None and gone > remote_ct:
-            if gi("update-index", "--force-remove", "--", path).returncode == 0:
-                removed.append(path)
-    return written, kept, removed, None
+        if os.path.lexists(history.repo / path) or entries[path] not in history.seen(path, path):
+            continue
+        if gi("update-index", "--force-remove", "--", path).returncode == 0:
+            res["removed"].append(path)
+            lineage.pop(path, None)
+    if res["written"] or res["removed"]:
+        body = json.dumps(lineage, indent=1, sort_keys=True).encode() + b"\n"
+        gi("update-index", "--add", "--cacheinfo", f"100644,{_hash_bytes(gi, body)},{LINEAGE}")
+    return res
 
 
-def _kept_suffix(kept: list) -> str:
-    return f"; kept-newer-remote: {', '.join(kept)}" if kept else ""
+def _kept_suffix(res: dict) -> str:
+    out = ""
+    if res["kept"]:
+        out += f"; kept-newer-remote: {', '.join(res['kept'])}"
+    if res["conflict"]:
+        out += f"; kept-conflict (both sides changed, remote kept): {', '.join(res['conflict'])}"
+    return out
 
 
 def _build_and_push(g: _Git, files: dict, label: str, history: _History):
@@ -287,16 +366,17 @@ def _build_and_push(g: _Git, files: dict, label: str, history: _History):
         r = gi("read-tree", parent) if parent else gi("read-tree", "--empty")
         if r.returncode != 0:
             return True, f"{label}: read-tree failed ({_last(r.stderr)})"
-        written, kept, removed, err = _stage_notes(gi, parent, files, history)
-        if err:
-            return True, f"{label}: {err}"
+        res = _stage_notes(gi, parent, files, history)
+        if res["error"]:
+            return True, f"{label}: {res['error']}"
         tree = gi("write-tree").stdout.strip()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     if not tree:
         return True, f"{label}: write-tree produced nothing"
     if parent and g("rev-parse", f"{parent}^{{tree}}").stdout.strip() == tree:
-        return True, f"{label}: no change since {parent[:9]}; nothing to publish{_kept_suffix(kept)}"
+        _remember(history, res, published=False)
+        return True, f"{label}: no change since {parent[:9]}; nothing to publish{_kept_suffix(res)}"
 
     env_id = {}
     if not g("config", "user.email").stdout.strip():
@@ -314,9 +394,20 @@ def _build_and_push(g: _Git, files: dict, label: str, history: _History):
     p = g("push", "-q", "origin", f"{sha}:{REF}")
     if p.returncode != 0:
         return False, _last(p.stderr)
-    gone = f", removed {len(removed)}: {', '.join(removed)}" if removed else ""
-    return True, (f"{label}: published {len(written)} file(s){gone} to origin {BRANCH} "
-                  f"({sha[:9]}){_kept_suffix(kept)}")
+    _remember(history, res, published=True)
+    gone = f", removed {len(res['removed'])}: {', '.join(res['removed'])}" if res["removed"] else ""
+    return True, (f"{label}: published {len(res['written'])} file(s){gone} to origin {BRANCH} "
+                  f"({sha[:9]}){_kept_suffix(res)}")
+
+
+def _remember(history: _History, res: dict, published: bool) -> None:
+    """Record the versions the branch now holds as seen: equal ones always,
+    written ones only once the push landed."""
+    blocked = set(res["kept"]) | set(res["conflict"])
+    for path, sha in res["remember"]:
+        if path not in blocked and (published or path not in res["written"]):
+            history.remember(path, sha)
+    history.save()
 
 
 def publish_to(target: Path, files: dict, visibility, label: str, history: _History) -> list:
@@ -379,65 +470,70 @@ def _unsafe_target(root: Path, rel: str) -> bool:
     return False
 
 
-def _overlay_wanted(g: _Git, root: Path, rref: str, rel: str) -> bool:
-    """Is the kipi/notes copy of `rel` newer than what this checkout holds?"""
-    notes_ct = _ct(g, rref, "--", rel)
-    if notes_ct is None:
+def _overlay_wanted(g: _Git, root: Path, rel: str, remote: str, lineage: dict,
+                    history: _History) -> bool:
+    """Does the kipi/notes copy of `rel` supersede what this checkout holds?
+
+    Lineage, never clocks (codex round 3, #464). An absent local file is written
+    unless this checkout saw that exact copy and then deleted it (a closed
+    .active-case must not come back). A present one is replaced only when its
+    exact content is already in the branch's lineage, so nothing local is lost:
+    an uncommitted or independent local edit is never in it.
+    """
+    dest = root / rel
+    if not dest.exists():
+        return remote not in history.seen(rel, rel)
+    local = g("hash-object", "--no-filters", str(dest), timeout=10).stdout.strip()
+    if local == remote:
+        history.remember(rel, remote)
         return False
-    if not (root / rel).exists():
-        # A path deleted locally AFTER the remote copy stays deleted (a closed
-        # .active-case must not come back); one that never existed is written.
-        gone = _ct(g, "--diff-filter=D", "HEAD", "--", rel)
-        return gone is None or notes_ct > gone
-    tracked = g("ls-files", "--error-unmatch", "--", rel).returncode == 0
-    if not tracked or g("diff", "--quiet", "HEAD", "--", rel).returncode != 0:
-        return False                               # local, uncommitted work wins
-    local_ct = _ct(g, "HEAD", "--", rel)
-    return local_ct is not None and notes_ct > local_ct
+    return bool(local) and local in lineage.get(rel, ())
 
 
 def overlay(repo: str, remote=None) -> list:
-    """Write kipi/notes files into the working tree where they are newer. Never stages."""
-    remote = is_remote_session() if remote is None else remote
-    if not remote:
-        return []                                  # local sessions: silent no-op
+    """Write kipi/notes files that supersede the local copy into the tree. Never stages.
+
+    Runs in every session (round 3): a checkout that only ever publishes never
+    learns a copy another machine wrote, and would keep-conflict forever. A
+    local session prints only when it overlaid something.
+    """
+    quiet = not (is_remote_session() if remote is None else remote)
     root = Path(repo).resolve()
     if not (root / ".git").exists():
-        return ["notes-overlay: not a git checkout; nothing to overlay"]
+        return [] if quiet else ["notes-overlay: not a git checkout; nothing to overlay"]
     g = _Git(root)
     r = g("ls-remote", "origin", REF, timeout=OVERLAY_TIMEOUT)
     if r.returncode != 0:
-        return [f"notes-overlay: could not reach origin ({_last(r.stderr)}); nothing overlaid"]
+        return [] if quiet else [f"notes-overlay: could not reach origin ({_last(r.stderr)}); nothing overlaid"]
     if not r.stdout.strip():
-        return [f"notes-overlay: origin has no {BRANCH}; nothing to overlay"]
+        return [] if quiet else [f"notes-overlay: origin has no {BRANCH}; nothing to overlay"]
     rref = f"refs/remotes/origin/{BRANCH}"
     r = g("fetch", "-q", "origin", f"+{REF}:{rref}", timeout=OVERLAY_TIMEOUT)
     if r.returncode != 0:
-        return [f"notes-overlay: could not fetch {BRANCH} ({_last(r.stderr)}); nothing overlaid"]
+        return [] if quiet else [f"notes-overlay: could not fetch {BRANCH} ({_last(r.stderr)}); nothing overlaid"]
     tip = g("rev-parse", rref).stdout.strip()
-    names = g("ls-tree", "-r", "-z", "--name-only", rref).stdout.split("\0")
+    entries, lineage = _entries(g, rref), _lineage(g, rref)
+    history = _History(root, tracks_deletions=True)
     written = []
-    for rel in sorted(n for n in names if n):
+    for rel, sha in sorted(entries.items()):
         # The allowlist is the only gate; kipi-system/ entries mirror ANOTHER repo's
         # RCAs (the skeleton's), so they are not this working tree's files.
-        if not is_notes_path(rel) or rel.startswith(SKELETON_PREFIX):
+        if not is_notes_path(rel) or rel.startswith(SKELETON_PREFIX) or _unsafe_target(root, rel):
             continue
-        if _unsafe_target(root, rel):
+        if not _overlay_wanted(g, root, rel, sha, lineage, history):
             continue
-        dest = root / rel
-        if not _overlay_wanted(g, root, rref, rel):
-            continue
-        blob = subprocess.run(["git", "cat-file", "blob", f"{rref}:{rel}"], cwd=root,
+        blob = subprocess.run(["git", "cat-file", "blob", sha], cwd=root,
                               env=g.env, capture_output=True, timeout=10)
         if blob.returncode != 0:
             continue
-        if dest.exists() and dest.read_bytes() == blob.stdout:
-            continue
+        dest = root / rel
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(blob.stdout)
+        history.remember(rel, sha)
         written.append(rel)
+    history.save()
     if not written:
-        return [f"notes-overlay: nothing newer on origin {BRANCH} ({tip[:9]})"]
+        return [] if quiet else [f"notes-overlay: nothing newer on origin {BRANCH} ({tip[:9]})"]
     return [f"notes-overlay: overlaid {len(written)} file(s) from origin {BRANCH} "
             f"({tip[:9]}), unstaged: {', '.join(written)}"]
 
