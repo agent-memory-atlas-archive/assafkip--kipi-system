@@ -736,3 +736,82 @@ def test_overlay_recreates_when_the_remote_copy_is_newer_than_the_deletion(tmp_p
     git(tmp_path, "clone", "-q", "-b", "work", str(bare), str(cloud))
     r = overlay(cloud)
     assert (cloud / ACTIVE).read_text() == "case-002\n", r.stdout
+
+
+# --- round 4 (codex, #464): deletions reach stale checkouts; last file; nested --
+
+def _published_then_closed(tmp_path):
+    """a publishes an open case; b clones before the close; a closes and publishes."""
+    a, bare = make_repo(tmp_path, "a")
+    write(a, ACTIVE, "case-001\n")
+    write(a, HANDOFF_PATH, "handoff\n")
+    commit_at(a, "2026-09-01T00:00:00+0000", "open case", ACTIVE, HANDOFF_PATH)
+    git(a, "push", "-q", "origin", "work")
+    assert "published" in publish(a).stdout
+    b = tmp_path / "b"
+    git(tmp_path, "clone", "-q", "-b", "work", str(bare), str(b))
+    git(b, "config", "user.email", "t@t.t")
+    git(b, "config", "user.name", "t")
+    git(a, "rm", "-q", ACTIVE)
+    commit_at(a, "2026-09-02T00:00:00+0000", "close case")
+    r = publish(a)
+    assert ACTIVE not in remote_tree(bare), r.stdout
+    return a, b, bare
+
+
+def test_a_stale_checkout_never_republishes_a_case_closed_elsewhere(tmp_path):
+    """RED on a85f667f: b still holds case-001, the branch no longer does, so b
+    wrote it back and the closed case came back for every reader."""
+    _, b, bare = _published_then_closed(tmp_path)
+    r = publish(b)
+    assert ACTIVE not in remote_tree(bare), r.stdout
+    assert "deleted elsewhere" in r.stdout and ACTIVE in r.stdout, r.stdout
+
+
+def test_the_overlay_consumes_a_deletion_made_elsewhere(tmp_path):
+    """RED on a85f667f: nothing ever removed the stale local copy."""
+    _, b, _ = _published_then_closed(tmp_path)
+    r = overlay(b, remote=False)
+    assert not (b / ACTIVE).exists(), r.stdout
+    assert "deleted elsewhere" in r.stdout
+
+
+def test_a_case_reopened_with_new_content_after_the_close_is_published(tmp_path):
+    """Control: a tombstone covers the deleted version only, never new work."""
+    _, b, bare = _published_then_closed(tmp_path)
+    write(b, ACTIVE, "case-002\n")
+    commit_at(b, "2026-09-03T00:00:00+0000", "reopen", ACTIVE)
+    r = publish(b)
+    assert notes_body(bare, ACTIVE) == "case-002\n", r.stdout
+    overlay(b, remote=False)
+    assert (b / ACTIVE).read_text() == "case-002\n"
+
+
+def test_deleting_the_last_notes_file_still_reaches_kipi_notes(tmp_path):
+    """RED on a85f667f: an empty collection returned before the deletion engine."""
+    root, bare = make_repo(tmp_path)
+    write(root, ACTIVE, "case-001\n")
+    commit_at(root, "2026-09-01T00:00:00+0000", "open", ACTIVE)
+    assert "published 1" in publish(root).stdout
+    git(root, "rm", "-q", ACTIVE)
+    commit_at(root, "2026-09-02T00:00:00+0000", "close")
+    r = publish(root)
+    assert notes_tree(bare) == [], r.stdout
+    assert "removed 1" in r.stdout, r.stdout
+
+
+def test_an_empty_checkout_with_no_branch_publishes_nothing(tmp_path):
+    root, bare = make_repo(tmp_path)
+    r = publish(root)
+    assert remote_tip(bare) is None and "nothing to publish" in r.stdout, r.stdout
+
+
+def test_a_legacy_nested_instance_publishes_the_handoff_session_start_reads(tmp_path):
+    """RED on a85f667f (codex minor): session-start reads q-system/q-system/ in a
+    subtree instance, and the publisher never collected it."""
+    root, bare = make_repo(tmp_path)
+    (root / "q-system" / "q-system" / "canonical").mkdir(parents=True)
+    nested = "q-system/q-system/memory/last-handoff.md"
+    write(root, nested, "nested handoff\n")
+    r = publish(root)
+    assert notes_body(bare, nested) == "nested handoff\n", r.stdout

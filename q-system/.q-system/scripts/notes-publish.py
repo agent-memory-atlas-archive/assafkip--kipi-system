@@ -29,7 +29,12 @@ update-index --cacheinfo, write-tree, commit-tree, push <sha>:refs/heads/kipi/no
     the versions each copy superseded) already holds the local copy,
     `kept-conflict` when both sides changed independently. A notes path deleted
     locally is removed from the branch only while the branch still holds a copy
-    this checkout saw (instance mode only);
+    this checkout saw (instance mode only), and LINEAGE keeps a tombstone
+    (`.deleted`) so a stale checkout still holding that exact copy never writes it
+    back, and its overlay removes it; an empty collection still reaches deletion
+    (codex round 4);
+  - a legacy subtree instance's q-system/q-system/ is collected too, the root
+    session-start.py reads the handoff from;
   - no change -> no commit; a rejected push (race) is refetched, rebuilt and
     retried once, then logged and dropped. Commits end `[skip ci]`.
 
@@ -79,7 +84,7 @@ ACTIVE_CASE = ".active-case"
 CASE_FILES = ("memory/last-handoff.md", "memory/investigation-state.md")
 
 _NOTES_RE = re.compile(
-    r"^(?:q-[^/]+/(?:memory/last-handoff\.md|dashboard\.md|memory/investigation-state\.md"
+    r"^(?:(?:q-system/)?q-[^/]+/(?:memory/last-handoff\.md|dashboard\.md|memory/investigation-state\.md"
     r"|\.active-case|investigations/case-[^/]+/memory/(?:last-handoff|investigation-state)\.md"
     r"|output/rca/[^/]+\.md)"
     r"|kipi-system/output/rca/[^/]+\.md)$")
@@ -131,7 +136,8 @@ def _plain_file(p: Path) -> bool:
 def collect_instance(root: Path) -> dict:
     """tree path -> source file, for every q-* dir (q-system included)."""
     out = {}
-    for q in sorted(root.glob("q-*")):
+    nested = root / "q-system" / "q-system"   # legacy subtree layout, as session-start reads it
+    for q in sorted(root.glob("q-*")) + ([nested] if nested.is_dir() else []):
         if not q.is_dir() or q.is_symlink():
             continue
         cands = [q / HANDOFF, q / ACTIVE_CASE] + [q / r for r in STATE_FILES]
@@ -189,6 +195,7 @@ def _last(stderr: str) -> str:
 
 
 LINEAGE = ".kipi-notes-lineage.json"   # on kipi/notes only; never a notes path, never overlaid
+DELETED = ".deleted"                    # LINEAGE key: path -> versions a checkout deleted (round 4)
 LINEAGE_CAP = 200                       # versions kept per path, newest last
 SEEN_FILE = "kipi-notes-seen.json"      # under this checkout's git dir, never committed
 
@@ -303,7 +310,9 @@ def _stage_notes(gi: _Git, parent, files: dict, history: _History) -> dict:
     Returns {written, kept, conflict, removed, remember, error}.
     """
     entries, lineage = _entries(gi, parent), _lineage(gi, parent)
-    res = {"written": [], "kept": [], "conflict": [], "removed": [], "remember": [], "error": None}
+    tombs = lineage.setdefault(DELETED, {})
+    res = {"written": [], "kept": [], "conflict": [], "removed": [], "deleted_remote": [],
+           "remember": [], "error": None}
     for path, src in sorted(files.items()):
         if not is_notes_path(path):          # belt and braces: never code
             continue
@@ -316,6 +325,11 @@ def _stage_notes(gi: _Git, parent, files: dict, history: _History) -> dict:
         if remote == sha:
             continue
         rel = src.relative_to(history.repo).as_posix()
+        if remote is None and sha in tombs.get(path, ()):
+            # codex round 4: another checkout deleted exactly this copy; a stale
+            # checkout that still holds it must not bring it back.
+            res["deleted_remote"].append(path)
+            continue
         if remote is not None and remote not in history.seen(path, rel):
             res["kept" if sha in lineage.get(path, ()) else "conflict"].append(path)
             continue
@@ -325,6 +339,7 @@ def _stage_notes(gi: _Git, parent, files: dict, history: _History) -> dict:
             return res
         lineage[path] = _cap(list(lineage.get(path, [])) + ([remote] if remote else [])
                              + history.versions(rel) + [sha])
+        tombs.pop(path, None)                # recreated with new content: live again
         res["written"].append(path)
     for path in sorted(set(entries) - set(files)):
         if not is_notes_path(path) or path.startswith(SKELETON_PREFIX) or not history.tracks_deletions:
@@ -333,7 +348,7 @@ def _stage_notes(gi: _Git, parent, files: dict, history: _History) -> dict:
             continue
         if gi("update-index", "--force-remove", "--", path).returncode == 0:
             res["removed"].append(path)
-            lineage.pop(path, None)
+            tombs[path] = _cap(list(lineage.pop(path, [])) + [entries[path]])
     if res["written"] or res["removed"]:
         body = json.dumps(lineage, indent=1, sort_keys=True).encode() + b"\n"
         gi("update-index", "--add", "--cacheinfo", f"100644,{_hash_bytes(gi, body)},{LINEAGE}")
@@ -346,6 +361,8 @@ def _kept_suffix(res: dict) -> str:
         out += f"; kept-newer-remote: {', '.join(res['kept'])}"
     if res["conflict"]:
         out += f"; kept-conflict (both sides changed, remote kept): {', '.join(res['conflict'])}"
+    if res["deleted_remote"]:
+        out += f"; not republished (deleted elsewhere): {', '.join(res['deleted_remote'])}"
     return out
 
 
@@ -355,6 +372,8 @@ def _build_and_push(g: _Git, files: dict, label: str, history: _History):
     if r.returncode != 0:
         return True, f"{label}: could not reach origin ({_last(r.stderr)}); publishing nothing"
     parent = r.stdout.split()[0] if r.stdout.strip() else None
+    if not parent and not files:
+        return True, f"{label}: no notes files; nothing to publish"
     if parent:
         r = g("fetch", "-q", "origin", f"+{REF}:refs/remotes/origin/{BRANCH}")
         if r.returncode != 0:
@@ -411,7 +430,7 @@ def _remember(history: _History, res: dict, published: bool) -> None:
 
 
 def publish_to(target: Path, files: dict, visibility, label: str, history: _History) -> list:
-    if not files:
+    if not files and not history.tracks_deletions:
         return [f"{label}: no notes files; nothing to publish"]
     g = _Git(target)
     r = g("remote", "get-url", "origin", timeout=10)
@@ -490,6 +509,25 @@ def _overlay_wanted(g: _Git, root: Path, rel: str, remote: str, lineage: dict,
     return bool(local) and local in lineage.get(rel, ())
 
 
+def _consume_deletions(g: _Git, root: Path, entries: dict, tombs: dict) -> list:
+    """Remove local copies another checkout deleted (codex round 4, #464).
+
+    Only when the local content is EXACTLY a deleted version: an edit made after
+    the deletion is new work and stays. Unstaged, like every overlay write.
+    """
+    removed = []
+    for rel, shas in sorted(tombs.items()):
+        if rel in entries or not is_notes_path(rel) or rel.startswith(SKELETON_PREFIX):
+            continue
+        if _unsafe_target(root, rel) or not (root / rel).is_file():
+            continue
+        local = g("hash-object", "--no-filters", str(root / rel), timeout=10).stdout.strip()
+        if local and local in shas:
+            (root / rel).unlink()
+            removed.append(rel)
+    return removed
+
+
 def overlay(repo: str, remote=None) -> list:
     """Write kipi/notes files that supersede the local copy into the tree. Never stages.
 
@@ -531,11 +569,13 @@ def overlay(repo: str, remote=None) -> list:
         dest.write_bytes(blob.stdout)
         history.remember(rel, sha)
         written.append(rel)
+    removed = _consume_deletions(g, root, entries, lineage.get(DELETED, {}))
     history.save()
-    if not written:
+    if not written and not removed:
         return [] if quiet else [f"notes-overlay: nothing newer on origin {BRANCH} ({tip[:9]})"]
+    gone = f"; removed (deleted elsewhere): {', '.join(removed)}" if removed else ""
     return [f"notes-overlay: overlaid {len(written)} file(s) from origin {BRANCH} "
-            f"({tip[:9]}), unstaged: {', '.join(written)}"]
+            f"({tip[:9]}), unstaged: {', '.join(written) or 'none'}{gone}"]
 
 
 def main(argv=None) -> int:
