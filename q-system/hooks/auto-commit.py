@@ -832,7 +832,34 @@ def publish_notes():
         print(f"auto-commit: notes-publish error: {e}", file=sys.stderr)
 
 
+# A paused merge/rebase/cherry-pick/revert. git reports its conflicted files as
+# ordinary changes, so without this guard the autosave staged and committed
+# conflict markers (cole-gtm 9e563be, 2026-09-29) and notes-publish would push
+# them to kipi/notes. The operation belongs to whoever started it.
+GIT_OPERATION_MARKERS = ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD",
+                         "rebase-merge", "rebase-apply")
+
+
+def git_operation_in_progress():
+    """The marker of a paused git operation in this checkout, or None."""
+    for marker in GIT_OPERATION_MARKERS:
+        r = run(["git", "rev-parse", "--git-path", marker])
+        if r.returncode != 0:
+            return None
+        path = r.stdout.strip()
+        if not os.path.isabs(path):
+            path = os.path.join(PROJ_DIR, path)
+        if os.path.exists(path):
+            return marker
+    return None
+
+
 def main():
+    paused = git_operation_in_progress()
+    if paused is not None:
+        print(f"auto-commit: git merge in progress ({paused}); committing nothing, "
+              "notes not published. Finish or abort it first.")
+        return
     try:
         _commit_main()
     finally:
