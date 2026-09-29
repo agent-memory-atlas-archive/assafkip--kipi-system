@@ -133,14 +133,6 @@
       "has_git": true
     },
     {
-      "name": "fractional-cxo",
-      "path": "/Users/assafkipnis/projects/consulting/projects/fractional-cxo",
-      "subtree_prefix": "q-system",
-      "instance_q_dir": null,
-      "type": "subtree",
-      "has_git": true
-    },
-    {
       "name": "interview-coach",
       "path": "/Users/assafkipnis/projects/micro-saas/projects/interview-coach",
       "subtree_prefix": "q-system",
