@@ -21,6 +21,12 @@ update-index --cacheinfo, write-tree, commit-tree, push <sha>:refs/heads/kipi/no
     as instance-automation-guard) the repo is public, so its RCAs go to the
     consulting checkout's `kipi/notes` under `kipi-system/output/rca/` and its
     own handoff is published nowhere (founder choice b, 2026-09-28);
+  - per path, NEWER WINS (codex round 2, #464): a local file replaces the
+    kipi/notes entry only when its last local commit (an uncommitted edit counts
+    as now; a never-committed file uses its mtime) is newer than kipi/notes' last
+    commit touching that path, or the path is absent there; otherwise the entry
+    is kept and reported `kept-newer-remote`. A notes path deleted locally AFTER
+    kipi/notes' copy is removed from the branch (instance mode only);
   - no change -> no commit; a rejected push (race) is refetched, rebuilt and
     retried once, then logged and dropped. Commits end `[skip ci]`.
 
@@ -29,7 +35,7 @@ a cloud session still loaded the stale default-branch handoff). Only when
 CLAUDE_CODE_REMOTE is true (the cloud session runtime sets it; injectable for tests)
 and origin has kipi/notes: fetch it and write each allowlisted notes file into the
 working tree when its last kipi/notes commit is newer than the local file's last
-commit, or the local file is absent. It never writes a code path, never stages or
+commit, or the local file is absent and was not deleted locally after that copy. It never writes a code path, never stages or
 commits, never overwrites uncommitted local edits or writes through a symlink.
 Called from q-system/hooks/session-start.py before the handoff is loaded.
 
@@ -177,7 +183,94 @@ def _last(stderr: str) -> str:
     return lines[-1] if lines else "no error text"
 
 
-def _build_and_push(g: _Git, files: dict, label: str):
+def _ct(g: _Git, *args) -> float | None:
+    """Commit time (epoch s) of the last commit `git log` selects, or None."""
+    out = g("log", "-1", "--format=%ct", *args, timeout=10).stdout.strip()
+    return float(out) if out else None
+
+
+class _History:
+    """The LOCAL side of every per-path decision (codex round 2, #464).
+
+    why: publish used to replace every remote entry with whatever file was on
+    disk, so a stale clone publishing after a fresh one overwrote the newer
+    handoff and still said "published"; and a deleted state file stayed on
+    kipi/notes forever, so an overlay resurrected a closed .active-case.
+    """
+
+    def __init__(self, repo: Path, tracks_deletions: bool):
+        self.repo, self.g, self.tracks_deletions = repo, _Git(repo), tracks_deletions
+
+    def stamp(self, src: Path) -> float:
+        """When the local copy of this file was last committed."""
+        rel = src.relative_to(self.repo).as_posix()
+        if self.g("ls-files", "--error-unmatch", "--", rel, timeout=10).returncode != 0:
+            return src.stat().st_mtime      # never committed (ignored RCAs): its mtime
+        if self.g("diff", "--quiet", "HEAD", "--", rel, timeout=10).returncode != 0:
+            # auto-commit.py runs BEFORE publish, so an edit still uncommitted
+            # here is the freshest copy there is: treat it as committed now.
+            return time.time()
+        return _ct(self.g, "HEAD", "--", rel) or time.time()
+
+    def deleted_at(self, rel: str) -> float | None:
+        """When this path was last deleted in local history, or None."""
+        if not self.tracks_deletions:
+            return None
+        return _ct(self.g, "--diff-filter=D", "HEAD", "--", rel)
+
+
+def _entries(g: _Git, commit) -> dict:
+    """path -> blob sha on a notes commit ({} for none)."""
+    if not commit:
+        return {}
+    out = {}
+    for rec in g("ls-tree", "-r", "-z", commit).stdout.split("\0"):
+        if "\t" in rec:
+            meta, path = rec.split("\t", 1)
+            out[path] = meta.split()[2]
+    return out
+
+
+def _stage_notes(gi: _Git, parent, files: dict, history: _History):
+    """Newer wins per path; deletions newer than the remote copy propagate.
+
+    Returns (written, kept, removed, error). Only `written`/`removed` changed the tree.
+    """
+    entries = _entries(gi, parent)
+    written, kept, removed = [], [], []
+    for path, src in sorted(files.items()):
+        if not is_notes_path(path):          # belt and braces: never code
+            continue
+        h = gi("hash-object", "-w", "--no-filters", str(src))
+        if h.returncode != 0:
+            return written, kept, removed, f"hash-object failed for {path} ({_last(h.stderr)})"
+        sha = h.stdout.strip()
+        if entries.get(path) == sha:
+            continue
+        if path in entries:
+            remote_ct = _ct(gi, parent, "--", path)
+            if remote_ct is not None and history.stamp(src) <= remote_ct:
+                kept.append(path)            # the remote copy is newer: never replace it
+                continue
+        u = gi("update-index", "--add", "--cacheinfo", f"100644,{sha},{path}")
+        if u.returncode != 0:
+            return written, kept, removed, f"update-index failed for {path} ({_last(u.stderr)})"
+        written.append(path)
+    for path in sorted(set(entries) - set(files)):
+        if not is_notes_path(path) or path.startswith(SKELETON_PREFIX):
+            continue
+        gone, remote_ct = history.deleted_at(path), _ct(gi, parent, "--", path)
+        if gone is not None and remote_ct is not None and gone > remote_ct:
+            if gi("update-index", "--force-remove", "--", path).returncode == 0:
+                removed.append(path)
+    return written, kept, removed, None
+
+
+def _kept_suffix(kept: list) -> str:
+    return f"; kept-newer-remote: {', '.join(kept)}" if kept else ""
+
+
+def _build_and_push(g: _Git, files: dict, label: str, history: _History):
     """One attempt. Returns (done, line); done=False means retryable push rejection."""
     r = g("ls-remote", "origin", REF)
     if r.returncode != 0:
@@ -194,22 +287,16 @@ def _build_and_push(g: _Git, files: dict, label: str):
         r = gi("read-tree", parent) if parent else gi("read-tree", "--empty")
         if r.returncode != 0:
             return True, f"{label}: read-tree failed ({_last(r.stderr)})"
-        for path, src in sorted(files.items()):
-            if not is_notes_path(path):          # belt and braces: never code
-                continue
-            h = gi("hash-object", "-w", "--no-filters", str(src))
-            if h.returncode != 0:
-                return True, f"{label}: hash-object failed for {path} ({_last(h.stderr)})"
-            u = gi("update-index", "--add", "--cacheinfo", f"100644,{h.stdout.strip()},{path}")
-            if u.returncode != 0:
-                return True, f"{label}: update-index failed for {path} ({_last(u.stderr)})"
+        written, kept, removed, err = _stage_notes(gi, parent, files, history)
+        if err:
+            return True, f"{label}: {err}"
         tree = gi("write-tree").stdout.strip()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     if not tree:
         return True, f"{label}: write-tree produced nothing"
     if parent and g("rev-parse", f"{parent}^{{tree}}").stdout.strip() == tree:
-        return True, f"{label}: no change since {parent[:9]}; nothing to publish"
+        return True, f"{label}: no change since {parent[:9]}; nothing to publish{_kept_suffix(kept)}"
 
     env_id = {}
     if not g("config", "user.email").stdout.strip():
@@ -227,10 +314,12 @@ def _build_and_push(g: _Git, files: dict, label: str):
     p = g("push", "-q", "origin", f"{sha}:{REF}")
     if p.returncode != 0:
         return False, _last(p.stderr)
-    return True, f"{label}: published {len(files)} file(s) to origin {BRANCH} ({sha[:9]})"
+    gone = f", removed {len(removed)}: {', '.join(removed)}" if removed else ""
+    return True, (f"{label}: published {len(written)} file(s){gone} to origin {BRANCH} "
+                  f"({sha[:9]}){_kept_suffix(kept)}")
 
 
-def publish_to(target: Path, files: dict, visibility, label: str) -> list:
+def publish_to(target: Path, files: dict, visibility, label: str, history: _History) -> list:
     if not files:
         return [f"{label}: no notes files; nothing to publish"]
     g = _Git(target)
@@ -245,7 +334,7 @@ def publish_to(target: Path, files: dict, visibility, label: str) -> list:
         return [f"{label}: origin visibility unknown ({vis}); publishing nothing"]
     lines = []
     for attempt in (1, 2):
-        done, line = _build_and_push(g, files, label)
+        done, line = _build_and_push(g, files, label, history)
         if done:
             return lines + [line]
         if attempt == 1:
@@ -267,8 +356,11 @@ def run(repo: str, visibility=None) -> list:
         target, why = consulting_checkout(root)
         if target is None:
             return [f"notes-publish: skeleton RCAs not published: {why}"]
-        return publish_to(target, rcas, visibility, "notes-publish (skeleton RCAs -> consulting)")
-    return publish_to(root, collect_instance(root), visibility, "notes-publish")
+        # The skeleton's history says nothing about consulting's own paths: no deletions.
+        return publish_to(target, rcas, visibility, "notes-publish (skeleton RCAs -> consulting)",
+                          _History(root, tracks_deletions=False))
+    return publish_to(root, collect_instance(root), visibility, "notes-publish",
+                      _History(root, tracks_deletions=True))
 
 
 def is_remote_session(env=None) -> bool:
@@ -285,6 +377,23 @@ def _unsafe_target(root: Path, rel: str) -> bool:
         if p.is_symlink():
             return True
     return False
+
+
+def _overlay_wanted(g: _Git, root: Path, rref: str, rel: str) -> bool:
+    """Is the kipi/notes copy of `rel` newer than what this checkout holds?"""
+    notes_ct = _ct(g, rref, "--", rel)
+    if notes_ct is None:
+        return False
+    if not (root / rel).exists():
+        # A path deleted locally AFTER the remote copy stays deleted (a closed
+        # .active-case must not come back); one that never existed is written.
+        gone = _ct(g, "--diff-filter=D", "HEAD", "--", rel)
+        return gone is None or notes_ct > gone
+    tracked = g("ls-files", "--error-unmatch", "--", rel).returncode == 0
+    if not tracked or g("diff", "--quiet", "HEAD", "--", rel).returncode != 0:
+        return False                               # local, uncommitted work wins
+    local_ct = _ct(g, "HEAD", "--", rel)
+    return local_ct is not None and notes_ct > local_ct
 
 
 def overlay(repo: str, remote=None) -> list:
@@ -316,14 +425,8 @@ def overlay(repo: str, remote=None) -> list:
         if _unsafe_target(root, rel):
             continue
         dest = root / rel
-        if dest.exists():
-            tracked = g("ls-files", "--error-unmatch", "--", rel).returncode == 0
-            if not tracked or g("diff", "--quiet", "HEAD", "--", rel).returncode != 0:
-                continue                           # local, uncommitted work wins
-            local_ct = g("log", "-1", "--format=%ct", "HEAD", "--", rel).stdout.strip()
-            notes_ct = g("log", "-1", "--format=%ct", rref, "--", rel).stdout.strip()
-            if not (local_ct and notes_ct and int(notes_ct) > int(local_ct)):
-                continue
+        if not _overlay_wanted(g, root, rref, rel):
+            continue
         blob = subprocess.run(["git", "cat-file", "blob", f"{rref}:{rel}"], cwd=root,
                               env=g.env, capture_output=True, timeout=10)
         if blob.returncode != 0:

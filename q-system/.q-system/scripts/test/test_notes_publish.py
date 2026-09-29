@@ -506,3 +506,123 @@ def test_session_start_runs_the_overlay_before_loading_the_handoff():
     main = src[src.index("def main"):]
     assert main.index("overlay_notes(") < main.index("load_handoff(")
     assert "timeout=" in src[src.index("def overlay_notes"):]
+
+
+# --- round 2 (codex, #464): newer wins per path, deletions propagate --------
+#
+# Every decision is per path, on history: the local side's last commit touching
+# the path (an uncommitted edit counts as committed now, because auto-commit runs
+# before publish) against kipi/notes' last commit touching it.
+
+ACTIVE = "q-ps/.active-case"
+
+
+def notes_body(bare, rel):
+    r = git(bare, "show", f"{BRANCH}:{rel}", check=False)
+    return r.stdout if r.returncode == 0 else None
+
+
+def test_an_older_local_handoff_does_not_replace_a_newer_remote_one(tmp_path):
+    """RED on b28cc6b8: every local file blindly replaced the remote entry."""
+    root, bare = make_repo(tmp_path)
+    write(root, HANDOFF_PATH, "old local\n")
+    commit_at(root, "2026-01-01T00:00:00+0000", "old handoff", HANDOFF_PATH)
+    push_notes_at(tmp_path, bare, "2026-09-01T00:00:00+0000", {HANDOFF_PATH: "newer remote\n"})
+    r = publish(root)
+    assert r.returncode == 0, r.stderr
+    assert notes_body(bare, HANDOFF_PATH) == "newer remote\n", r.stdout
+    assert "kept-newer-remote" in r.stdout and HANDOFF_PATH in r.stdout, r.stdout
+    assert "published" not in r.stdout, r.stdout
+
+
+def test_a_newer_local_handoff_replaces_the_remote_one(tmp_path):
+    root, bare = make_repo(tmp_path)
+    write(root, HANDOFF_PATH, "new local\n")
+    commit_at(root, "2026-09-20T00:00:00+0000", "new handoff", HANDOFF_PATH)
+    push_notes_at(tmp_path, bare, "2026-09-01T00:00:00+0000", {HANDOFF_PATH: "older remote\n"})
+    r = publish(root)
+    assert notes_body(bare, HANDOFF_PATH) == "new local\n", r.stdout
+    assert "published 1 file" in r.stdout and "kept-newer-remote" not in r.stdout
+
+
+def test_two_racing_publishers_the_stale_one_keeps_the_fresh_content(tmp_path):
+    a, bare = make_repo(tmp_path, "a")
+    write(a, HANDOFF_PATH, "stale\n")
+    commit_at(a, "2026-01-01T00:00:00+0000", "stale handoff", HANDOFF_PATH)
+    git(a, "push", "-q", "origin", "work")
+    b = tmp_path / "b"
+    git(tmp_path, "clone", "-q", "-b", "work", str(bare), str(b))
+    write(a, HANDOFF_PATH, "fresh from a\n")
+    commit_at(a, "2026-09-01T00:00:00+0000", "fresh handoff", HANDOFF_PATH)
+    assert "published" in publish(a).stdout
+    r = publish(b)                                   # b still holds the stale copy
+    assert notes_body(bare, HANDOFF_PATH) == "fresh from a\n", r.stdout
+    assert "kept-newer-remote" in r.stdout
+
+
+def _closed_case(tmp_path, deleted_at="2026-09-10T00:00:00+0000"):
+    """An instance that opened a case, published it (dated 09-01), then closed it."""
+    root, bare = make_repo(tmp_path)
+    write(root, ACTIVE, "case-001\n")
+    write(root, HANDOFF_PATH, "handoff\n")
+    commit_at(root, "2026-08-01T00:00:00+0000", "open case", ACTIVE, HANDOFF_PATH)
+    push_notes_at(tmp_path, bare, "2026-09-01T00:00:00+0000",
+                  {ACTIVE: "case-001\n", HANDOFF_PATH: "handoff\n"})
+    git(root, "rm", "-q", ACTIVE)
+    env = dict(os.environ, GIT_AUTHOR_DATE=deleted_at, GIT_COMMITTER_DATE=deleted_at)
+    subprocess.run(["git", "commit", "-q", "-m", "close case"], cwd=root, env=env, check=True)
+    git(root, "push", "-q", "origin", "work")
+    return root, bare
+
+
+def test_closing_active_case_locally_removes_it_from_kipi_notes(tmp_path):
+    """RED on b28cc6b8: a deleted state file stayed on kipi/notes forever."""
+    root, bare = _closed_case(tmp_path)
+    r = publish(root)
+    assert ACTIVE not in remote_tree(bare), r.stdout
+    assert HANDOFF_PATH in remote_tree(bare)
+    assert "removed 1" in r.stdout and ACTIVE in r.stdout, r.stdout
+
+
+def test_a_deletion_older_than_the_remote_copy_does_not_remove_it(tmp_path):
+    root, bare = _closed_case(tmp_path, deleted_at="2026-08-15T00:00:00+0000")
+    publish(root)
+    assert ACTIVE in remote_tree(bare)
+
+
+def test_a_cloud_overlay_after_the_close_does_not_resurrect_the_case(tmp_path):
+    root, bare = _closed_case(tmp_path)
+    publish(root)
+    cloud = tmp_path / "cloud"
+    git(tmp_path, "clone", "-q", "-b", "work", str(bare), str(cloud))
+    r = overlay(cloud)
+    assert not (cloud / ACTIVE).exists(), r.stdout
+
+
+def test_overlay_never_recreates_a_path_whose_local_deletion_is_newer(tmp_path):
+    """Remote still holds the case (the close was never published); the clone
+    has the close in its history, so the overlay must not bring it back."""
+    root, bare = _closed_case(tmp_path)              # remote .active-case dated 09-01
+    cloud = tmp_path / "cloud"
+    git(tmp_path, "clone", "-q", "-b", "work", str(bare), str(cloud))
+    git(tmp_path / "publisher", "checkout", "-q", "kipi/notes")
+    write(tmp_path / "publisher", "q-ps/dashboard.md", "never local\n")
+    commit_at(tmp_path / "publisher", "2026-09-02T00:00:00+0000", "dash", "q-ps/dashboard.md")
+    git(tmp_path / "publisher", "push", "-q", "origin", "HEAD:refs/heads/kipi/notes")
+    r = overlay(cloud)
+    assert not (cloud / ACTIVE).exists(), r.stdout
+    # control: a path that never existed locally is still overlaid
+    assert (cloud / "q-ps/dashboard.md").read_text() == "never local\n", r.stdout
+
+
+def test_overlay_recreates_when_the_remote_copy_is_newer_than_the_deletion(tmp_path):
+    root, bare = _closed_case(tmp_path)              # deleted 09-10
+    pub = tmp_path / "publisher"
+    git(pub, "checkout", "-q", "kipi/notes")
+    write(pub, ACTIVE, "case-002\n")
+    commit_at(pub, "2026-09-20T00:00:00+0000", "reopened elsewhere", ACTIVE)
+    git(pub, "push", "-q", "origin", "HEAD:refs/heads/kipi/notes")
+    cloud = tmp_path / "cloud"
+    git(tmp_path, "clone", "-q", "-b", "work", str(bare), str(cloud))
+    r = overlay(cloud)
+    assert (cloud / ACTIVE).read_text() == "case-002\n", r.stdout
