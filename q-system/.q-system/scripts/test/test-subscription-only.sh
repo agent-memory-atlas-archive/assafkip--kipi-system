@@ -24,6 +24,7 @@
 #           os.environ minus the key (proved by CALLING it with the key set),
 #           and no other line in the file names ANTHROPIC_API_KEY (no re-add).
 #           `env=os.environ`, `env=dict(os.environ)` or no env= all fail.
+#           An `opencode run` argv counts as a model call: it reads the key too.
 # Negative controls at the end prove each of those shapes is caught.
 set -uo pipefail
 
@@ -127,6 +128,10 @@ _SUBPROCESS = {"run", "Popen", "check_output", "check_call", "call"}
 
 def _argv_list(node):
     elts = node.elts
+    # OpenCode runs Anthropic models too and reads the same key, so its argv is a
+    # model call (codex minor on #464: prompt_render.py's OpenCode branch had no env=).
+    if elts and isinstance(elts[0], ast.Constant) and elts[0].value == "opencode":
+        return True
     if elts and cs._is_dash_p(elts[0]) and any(
             not (isinstance(e, ast.Constant) and isinstance(e.value, str) and e.value.startswith("-"))
             for e in elts[1:]):
@@ -292,6 +297,8 @@ PY_CONTROLS = {
     "env=dict(os.environ)": 'import os, subprocess\nenv = dict(os.environ)\nsubprocess.run(["claude", "-p", x], env=env)\n',
     "a helper that keeps the key": 'import os, subprocess\ndef subscription_env():\n    return dict(os.environ)\n'
                                    'subprocess.run(["claude", "-p", x], env=subscription_env())\n',
+    "an opencode run with no env=": 'import subprocess\nargs = ["opencode", "run", "--pure"]\n'
+                                    'args.append(p)\nsubprocess.run(args, text=True)\n',
     "a re-add after the helper": 'import os, subprocess\n' + HELPER +
                                  'e = subscription_env()\ne["ANTHROPIC_API_KEY"] = "k"\n'
                                  'subprocess.run(["claude", "-p", x], env=e)\n',

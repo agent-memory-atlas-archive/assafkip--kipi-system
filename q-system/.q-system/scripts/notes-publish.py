@@ -24,6 +24,15 @@ update-index --cacheinfo, write-tree, commit-tree, push <sha>:refs/heads/kipi/no
   - no change -> no commit; a rejected push (race) is refetched, rebuilt and
     retried once, then logged and dropped. Commits end `[skip ci]`.
 
+`--overlay` is the READ side (codex major on #464: the branch had no consumer, so
+a cloud session still loaded the stale default-branch handoff). Only when
+CLAUDE_CODE_REMOTE is true (the cloud session runtime sets it; injectable for tests)
+and origin has kipi/notes: fetch it and write each allowlisted notes file into the
+working tree when its last kipi/notes commit is newer than the local file's last
+commit, or the local file is absent. It never writes a code path, never stages or
+commits, never overwrites uncommitted local edits or writes through a symlink.
+Called from q-system/hooks/session-start.py before the handoff is loaded.
+
 Called non-fatally at the end of auto-commit.py's main(). Always exits 0; every
 outcome is one `notes-publish:` line on STDOUT (the fleet wiring discards the
 hook's stderr). Test seam: KIPI_NOTES_VISIBILITY=public|private|unknown replaces
@@ -49,6 +58,7 @@ REF = "refs/heads/" + BRANCH
 CONSULTING = "ASK_AI_consultant"
 SKELETON_PREFIX = "kipi-system/output/rca/"
 NET_TIMEOUT = 30          # per network git call; the hook caps the whole run
+OVERLAY_TIMEOUT = 3       # per network git call on the SessionStart path (hook cap 5s)
 HTTP_TIMEOUT = 5
 
 # Mirrors chief/instance.py: HANDOFF, STATE_FILES, ACTIVE_CASE, CASE_FILES.
@@ -261,15 +271,85 @@ def run(repo: str, visibility=None) -> list:
     return publish_to(root, collect_instance(root), visibility, "notes-publish")
 
 
+def is_remote_session(env=None) -> bool:
+    """The cloud (web) session runtime sets CLAUDE_CODE_REMOTE=true in the session env."""
+    env = os.environ if env is None else env
+    return env.get("CLAUDE_CODE_REMOTE", "").strip().lower() in ("1", "true", "yes")
+
+
+def _unsafe_target(root: Path, rel: str) -> bool:
+    """True when writing root/rel would go through a symlink anywhere on the way."""
+    p = root
+    for part in rel.split("/"):
+        p = p / part
+        if p.is_symlink():
+            return True
+    return False
+
+
+def overlay(repo: str, remote=None) -> list:
+    """Write kipi/notes files into the working tree where they are newer. Never stages."""
+    remote = is_remote_session() if remote is None else remote
+    if not remote:
+        return []                                  # local sessions: silent no-op
+    root = Path(repo).resolve()
+    if not (root / ".git").exists():
+        return ["notes-overlay: not a git checkout; nothing to overlay"]
+    g = _Git(root)
+    r = g("ls-remote", "origin", REF, timeout=OVERLAY_TIMEOUT)
+    if r.returncode != 0:
+        return [f"notes-overlay: could not reach origin ({_last(r.stderr)}); nothing overlaid"]
+    if not r.stdout.strip():
+        return [f"notes-overlay: origin has no {BRANCH}; nothing to overlay"]
+    rref = f"refs/remotes/origin/{BRANCH}"
+    r = g("fetch", "-q", "origin", f"+{REF}:{rref}", timeout=OVERLAY_TIMEOUT)
+    if r.returncode != 0:
+        return [f"notes-overlay: could not fetch {BRANCH} ({_last(r.stderr)}); nothing overlaid"]
+    tip = g("rev-parse", rref).stdout.strip()
+    names = g("ls-tree", "-r", "-z", "--name-only", rref).stdout.split("\0")
+    written = []
+    for rel in sorted(n for n in names if n):
+        # The allowlist is the only gate; kipi-system/ entries mirror ANOTHER repo's
+        # RCAs (the skeleton's), so they are not this working tree's files.
+        if not is_notes_path(rel) or rel.startswith(SKELETON_PREFIX):
+            continue
+        if _unsafe_target(root, rel):
+            continue
+        dest = root / rel
+        if dest.exists():
+            tracked = g("ls-files", "--error-unmatch", "--", rel).returncode == 0
+            if not tracked or g("diff", "--quiet", "HEAD", "--", rel).returncode != 0:
+                continue                           # local, uncommitted work wins
+            local_ct = g("log", "-1", "--format=%ct", "HEAD", "--", rel).stdout.strip()
+            notes_ct = g("log", "-1", "--format=%ct", rref, "--", rel).stdout.strip()
+            if not (local_ct and notes_ct and int(notes_ct) > int(local_ct)):
+                continue
+        blob = subprocess.run(["git", "cat-file", "blob", f"{rref}:{rel}"], cwd=root,
+                              env=g.env, capture_output=True, timeout=10)
+        if blob.returncode != 0:
+            continue
+        if dest.exists() and dest.read_bytes() == blob.stdout:
+            continue
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(blob.stdout)
+        written.append(rel)
+    if not written:
+        return [f"notes-overlay: nothing newer on origin {BRANCH} ({tip[:9]})"]
+    return [f"notes-overlay: overlaid {len(written)} file(s) from origin {BRANCH} "
+            f"({tip[:9]}), unstaged: {', '.join(written)}"]
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--repo", default=os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
+    ap.add_argument("--overlay", action="store_true",
+                    help="read side: write newer kipi/notes files into a remote session's tree")
     args = ap.parse_args(argv)
     try:
-        for line in run(args.repo):
+        for line in (overlay(args.repo) if args.overlay else run(args.repo)):
             print(line)
-    except Exception as e:  # never fatal: the caller is a Stop hook
-        print(f"notes-publish: error: {type(e).__name__}: {e}")
+    except Exception as e:  # never fatal: the callers are Stop / SessionStart hooks
+        print(f"notes-{'overlay' if args.overlay else 'publish'}: error: {type(e).__name__}: {e}")
     return 0
 
 

@@ -367,3 +367,142 @@ def test_a_push_rejected_twice_stops_and_logs(tmp_path):
     assert r.returncode == 0
     assert remote_tip(bare) is None
     assert "push failed" in r.stdout
+
+
+# --- the consumer: a remote session overlays newer notes (codex major, #464) ---
+#
+# Publishing alone left kipi/notes with no reader in this repo: a cloud session
+# opened on an instance repo still loaded the stale default-branch handoff.
+# `--overlay` is that reader; session-start.py calls it before load_handoff().
+
+HANDOFF_PATH = "q-ps/memory/last-handoff.md"
+
+
+def overlay(root, remote=True):
+    """Run the overlay as the SessionStart hook would, remote detection injected."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE_CODE_REMOTE")}
+    if remote:
+        env["CLAUDE_CODE_REMOTE"] = "true"
+    return subprocess.run([sys.executable, str(SCRIPT), "--overlay", "--repo", str(root)],
+                          capture_output=True, text=True, env=env, timeout=60)
+
+
+def commit_at(root, when, msg, *paths):
+    git(root, "add", "-f", *paths)
+    env = dict(os.environ, GIT_AUTHOR_DATE=when, GIT_COMMITTER_DATE=when)
+    r = subprocess.run(["git", "commit", "-q", "-m", msg], cwd=root, env=env,
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+
+
+def push_notes_at(tmp_path, bare, when, files):
+    """Put `files` on the remote kipi/notes as one commit dated `when`."""
+    pub = tmp_path / "publisher"
+    git(tmp_path, "clone", "-q", str(bare), str(pub))
+    git(pub, "config", "user.email", "t@t.t")
+    git(pub, "config", "user.name", "t")
+    git(pub, "config", "commit.gpgsign", "false")
+    git(pub, "checkout", "-q", "--orphan", "kipi/notes")
+    git(pub, "rm", "-rq", "--cached", ".", check=False)
+    for rel, body in files.items():
+        write(pub, rel, body)
+    commit_at(pub, when, "notes [skip ci]", *files)
+    git(pub, "push", "-q", "origin", "HEAD:refs/heads/kipi/notes")
+
+
+def cloud_clone(tmp_path, bare, when_main):
+    """An instance whose default branch carries an OLD handoff, pushed, then cloned."""
+    src, _ = make_repo(tmp_path, "src")
+    git(src, "remote", "set-url", "origin", str(bare))
+    write(src, HANDOFF_PATH, "stale handoff\n")
+    commit_at(src, when_main, "old handoff", HANDOFF_PATH)
+    git(src, "push", "-q", "origin", "work")
+    clone = tmp_path / "cloud"
+    git(tmp_path, "clone", "-q", "-b", "work", str(bare), str(clone))
+    return clone
+
+
+def test_remote_session_overlays_a_newer_handoff_from_kipi_notes(tmp_path):
+    """RED on the old code: nothing in this repo reads kipi/notes."""
+    bare = tmp_path / "remote.git"
+    git(tmp_path, "init", "-q", "--bare", str(bare))
+    clone = cloud_clone(tmp_path, bare, "2026-01-01T00:00:00+0000")
+    push_notes_at(tmp_path, bare, "2026-09-01T00:00:00+0000",
+                  {HANDOFF_PATH: "fresh handoff\n",
+                   "q-ps/output/rca/rca-x-2026-09-01.md": "# RCA\n"})
+    index_before = (clone / ".git" / "index").read_bytes()
+    head_before = git(clone, "rev-parse", "HEAD").stdout
+    r = overlay(clone)
+    assert r.returncode == 0, r.stderr
+    assert (clone / HANDOFF_PATH).read_text() == "fresh handoff\n", r.stdout
+    assert (clone / "q-ps/output/rca/rca-x-2026-09-01.md").read_text() == "# RCA\n"
+    out = [ln for ln in r.stdout.splitlines() if ln.strip()]
+    assert len(out) == 1 and "overlaid 2" in out[0] and HANDOFF_PATH in out[0], r.stdout
+    # never stages, never commits, never moves HEAD
+    assert (clone / ".git" / "index").read_bytes() == index_before
+    assert git(clone, "rev-parse", "HEAD").stdout == head_before
+
+
+def test_a_local_handoff_newer_than_kipi_notes_is_kept(tmp_path):
+    bare = tmp_path / "remote.git"
+    git(tmp_path, "init", "-q", "--bare", str(bare))
+    clone = cloud_clone(tmp_path, bare, "2026-09-20T00:00:00+0000")
+    push_notes_at(tmp_path, bare, "2026-09-01T00:00:00+0000", {HANDOFF_PATH: "older notes\n"})
+    r = overlay(clone)
+    assert r.returncode == 0, r.stderr
+    assert (clone / HANDOFF_PATH).read_text() == "stale handoff\n", r.stdout
+    assert "nothing newer" in r.stdout
+
+
+def test_uncommitted_local_edits_are_never_overwritten(tmp_path):
+    bare = tmp_path / "remote.git"
+    git(tmp_path, "init", "-q", "--bare", str(bare))
+    clone = cloud_clone(tmp_path, bare, "2026-01-01T00:00:00+0000")
+    push_notes_at(tmp_path, bare, "2026-09-01T00:00:00+0000", {HANDOFF_PATH: "fresh\n"})
+    write(clone, HANDOFF_PATH, "work in progress\n")
+    overlay(clone)
+    assert (clone / HANDOFF_PATH).read_text() == "work in progress\n"
+
+
+def test_non_remote_session_is_a_no_op(tmp_path):
+    bare = tmp_path / "remote.git"
+    git(tmp_path, "init", "-q", "--bare", str(bare))
+    clone = cloud_clone(tmp_path, bare, "2026-01-01T00:00:00+0000")
+    push_notes_at(tmp_path, bare, "2026-09-01T00:00:00+0000", {HANDOFF_PATH: "fresh\n"})
+    r = overlay(clone, remote=False)
+    assert r.returncode == 0
+    assert (clone / HANDOFF_PATH).read_text() == "stale handoff\n"
+    assert r.stdout.strip() == ""
+
+
+def test_overlay_never_writes_a_code_file_from_the_branch(tmp_path):
+    """Negative control: a code path on kipi/notes is never written to the tree."""
+    bare = tmp_path / "remote.git"
+    git(tmp_path, "init", "-q", "--bare", str(bare))
+    clone = cloud_clone(tmp_path, bare, "2026-01-01T00:00:00+0000")
+    push_notes_at(tmp_path, bare, "2026-09-01T00:00:00+0000",
+                  {HANDOFF_PATH: "fresh\n", "q-ps/pipeline/code.py": "print('x')\n",
+                   "src/app.js": "x\n", "README.md": "overwritten\n"})
+    r = overlay(clone)
+    assert (clone / HANDOFF_PATH).read_text() == "fresh\n", r.stdout
+    assert not (clone / "q-ps/pipeline/code.py").exists()
+    assert not (clone / "src/app.js").exists()
+    assert (clone / "README.md").read_text() == "placeholder\n"
+
+
+def test_no_kipi_notes_branch_is_a_quiet_one_liner(tmp_path):
+    bare = tmp_path / "remote.git"
+    git(tmp_path, "init", "-q", "--bare", str(bare))
+    clone = cloud_clone(tmp_path, bare, "2026-01-01T00:00:00+0000")
+    r = overlay(clone)
+    assert r.returncode == 0
+    assert (clone / HANDOFF_PATH).read_text() == "stale handoff\n"
+    assert len(r.stdout.strip().splitlines()) == 1 and "no kipi/notes" in r.stdout
+
+
+def test_session_start_runs_the_overlay_before_loading_the_handoff():
+    src = (HERE.parents[2] / "hooks" / "session-start.py").read_text()
+    assert "notes-publish.py" in src and "--overlay" in src
+    main = src[src.index("def main"):]
+    assert main.index("overlay_notes(") < main.index("load_handoff(")
+    assert "timeout=" in src[src.index("def overlay_notes"):]

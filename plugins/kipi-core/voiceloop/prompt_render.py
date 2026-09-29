@@ -177,9 +177,11 @@ def run_model(prompt, claude_bin, timeout=TIMEOUT_SECONDS, runner=None,
             if active_model:
                 args.extend(["--model", active_model])
             args.append(prompt)
+            # env: OpenCode reads ANTHROPIC_API_KEY too, so this branch gets the
+            # same subscription-only env as the claude branch (codex minor, #464).
             result = subprocess.run(
                 args, capture_output=True, text=True,
-                timeout=timeout)
+                timeout=timeout, env=subscription_env())
             if result.returncode == 0:
                 parts = []
                 for line in result.stdout.splitlines():
