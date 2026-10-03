@@ -6,7 +6,7 @@ A count needs none of that. One line per admitted call, two limits, one alert.
 
     check(job, item=None) -> {"admit": bool, "mode": str, "reason": str|None}
 
-* Counts admitted calls per job per UTC day, and across the fleet per day.
+* Counts admitted calls per job (the usage ledger's `job`) per UTC day, and across the fleet per day.
 * Ledger: one JSON line per admitted call, in one append-only file per UTC day
   under KIPI_MODEL_GATE_DIR (default ~/.config/kipi/model-gate/). Sharded by
   day so a check reads one day of lines, not the whole history. File-locked.
@@ -31,12 +31,23 @@ import subprocess
 import sys
 import tempfile
 
-# Defaults derived 2026-10-03 from usage-ledger.jsonl, 2026-09-26..10-03 (UTC):
-# busiest job-day 1657 calls, busiest fleet-day 1679, each x1.5 rounded up.
-# The floors keep a quiet week from deriving a cap that strangles a normal day.
-PER_JOB_DEFAULT = max(2486, 100)
-FLEET_DEFAULT = max(2519, 300)
+# why these numbers: the first defaults (2486 / 2519) were x1.5 of the busiest
+# day in the window, and that day, 2026-10-01, WAS the runaway (critic.judge()
+# 1180 calls, revise 271, fleet 1679). A cap derived from the incident cannot stop
+# it. The second try (150 / 300) sat BELOW an ordinary day once voiceloop calls
+# were logged (PR #509 review): it would have refused normal work.
+# Derived 2026-10-03 from usage-ledger.jsonl, normal days since voiceloop logging
+# began, 2026-10-01 excluded: 09-30 (279), 10-02 (412), 10-03 (115, partial).
+#   per job: normal max 213 (one caller, 09-30) -> 2x, rounded down = 400
+#   fleet:   normal max 412 (10-02)             -> 2x, rounded down = 800
+# Both sit at or under half the runaway (1180 / 1679). A "job" is the usage
+# ledger's `job` field (CHIEF_JOB or the caller name, e.g. critic.judge()), not
+# the bot, so one looping caller stops without starving the rest of its bot.
+PER_JOB_DEFAULT = 400
+FLEET_DEFAULT = 800
 ENFORCE_FROM = "2026-10-10"
+#: The alert key for a fleet-wide breach. Not a valid job name, so it cannot collide.
+FLEET_KEY = "*fleet*"
 REFUSE = 3
 
 
@@ -119,7 +130,7 @@ def check(job: str, item: str | None = None, now=None) -> dict:
             fcntl.flock(fh, fcntl.LOCK_EX)
             fh.seek(0)
             job_n = fleet_n = 0
-            alerted = False
+            alerted_keys = set()
             for line in fh:
                 try:
                     row = json.loads(line)
@@ -128,18 +139,22 @@ def check(job: str, item: str | None = None, now=None) -> dict:
                 if row.get("kind") == "call":
                     fleet_n += 1
                     job_n += row.get("job") == job
-                elif row.get("kind") == "alerted" and row.get("job") == job:
-                    alerted = True
+                elif row.get("kind") == "alerted":
+                    alerted_keys.add(row.get("job"))
             reason = None
             if job_n >= per_job:
                 reason = f"job {job} at {job_n}/{per_job} calls today"
             elif fleet_n >= fleet:
-                reason = f"fleet at {fleet_n}/{fleet} calls today"
+                reason = f"fleet at {fleet_n}/{fleet} calls today (first over: job {job})"
+            # A fleet breach is ONE event, so it alerts under one key. Keyed on the job,
+            # one breach filed one identical ticket per distinct caller (PR #509 review).
+            alert_key = FLEET_KEY if reason and job_n < per_job else job
+            alerted = alert_key in alerted_keys
             admit = reason is None or m == "report"
             stamp = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             out = []
             if reason and not alerted:
-                out.append({"kind": "alerted", "job": job, "ts": stamp, "reason": reason})
+                out.append({"kind": "alerted", "job": alert_key, "ts": stamp, "reason": reason})
             if admit:
                 out.append({"kind": "call", "job": job, "item": item, "ts": stamp})
             fh.write("".join(json.dumps(r) + "\n" for r in out))
