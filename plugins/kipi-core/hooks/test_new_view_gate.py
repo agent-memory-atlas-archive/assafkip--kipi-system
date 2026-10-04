@@ -153,6 +153,70 @@ def main():
                 use("Write", {"file_path": tst, "content": "check('a', 1, 1)"},
                     result={"type": "create", "filePath": tst, "originalFile": None})]
         check("past create counts", run(tmp, made, "Edit", add2), 2)
+        # 14i. sp-df1f13a5 nit 1: a code read chained with a test run keeps the read credit
+        check("read && test run", run(tmp, hist + [use("Bash", {
+            "command": "git diff src/app.py && python3 tests/test_app.py"})], "Edit", add2), 0)
+        check("newline-chained read + test run", run(tmp, hist + [use("Bash", {
+            "command": "git diff src/app.py\npython3 tests/test_app.py"})], "Edit", add2), 0)
+        check("test run ; read", run(tmp, hist + [use("Bash", {
+            "command": "python3 tests/test_app.py; cat src/app.py"})], "Edit", add2), 0)
+        check("test run piped to tail", run(tmp, hist + [use("Bash", {
+            "command": "python3 tests/test_app.py | tail -3"})], "Edit", add2), 2)
+        # 14j. sp-df1f13a5 nit 2: suite runners are test runs, not views
+        for cmd in ["bash q-system/.q-system/verify.sh --changed --base origin/main | tail",
+                    "bash scripts/ci-shaped-run.sh --all 2>&1 | tail -3",
+                    "./run-tests.sh src/app.py | tail", "cd src/app.d && make test 2>&1 | tail -5",
+                    "npm test -- src/app.js | tail"]:
+            check(f"suite runner: {cmd[:30]}", run(tmp, hist + [use("Bash", {"command": cmd})], "Edit", add2), 2)
+        # 14k. sp-df1f13a5 nit 3: a past check()-style rewrite that adds checks resets
+        # the clock; one that adds none does not; an EMPTY stored original still counts
+        cbody = "check('a', 1, 1)\n"
+        cgrew = [use("Read", {"file_path": src}),
+                 use("Write", {"file_path": tst, "content": cbody + "check('b', 2, 2)\n"},
+                     result={"type": "update", "filePath": tst, "originalFile": cbody})]
+        check("past check-style rewrite adds checks", run(tmp, cgrew, "Edit", add2), 2)
+        csame = [use("Read", {"file_path": src}),
+                 use("Write", {"file_path": tst, "content": cbody},
+                     result={"type": "update", "filePath": tst, "originalFile": cbody})]
+        check("past check-style rewrite no new checks", run(tmp, csame, "Edit", add2), 0)
+        cempty = [use("Read", {"file_path": src}),
+                  use("Write", {"file_path": tst, "content": cbody},
+                      result={"type": "update", "filePath": tst, "originalFile": ""})]
+        check("past write over empty original", run(tmp, cempty, "Edit", add2), 2)
+        # 14m. review of #514 major 1: reading the test run's OWN output file is not a view
+        for cmd in ["bash q-system/.q-system/verify.sh --changed > /tmp/v.log; tail -40 /tmp/v.log",
+                    "make test > /tmp/t.log 2>&1; cat /tmp/t.log",
+                    "python3 tests/test_app.py > /tmp/o.txt; tail -5 /tmp/o.txt",
+                    "pytest -q 2>&1 | tee /tmp/p.log; grep FAIL /tmp/p.log"]:
+            check(f"run then read own log: {cmd[:30]}", run(tmp, hist + [use("Bash", {"command": cmd})], "Edit", add2), 2)
+        check("run to log, then read code", run(tmp, hist + [use("Bash", {
+            "command": "pytest -q > /tmp/p.log; grep -n foo src/app.py"})], "Edit", add2), 0)
+        # 14n. review of #514 major 2: a LIVE edit adding check() lines is a test add
+        cadd = {"file_path": str(t / "test_gate.py"), "old_string": "check('a', 1, 1)",
+                "new_string": "check('a', 1, 1)\ncheck('b', 2, 2)"}
+        check("live check() add, no view", run(tmp, [], "Edit", cadd), 2)
+        check("live check() add, with view", run(tmp, [use("Read", {"file_path": src})], "Edit", cadd), 0)
+        # 14o. review of #514 minor 3: reading a suite runner's SOURCE is a view
+        for cmd in ["cat q-system/.q-system/verify.sh", "sed -n '1,60p' scripts/run-tests.sh"]:
+            check(f"read runner source: {cmd[:24]}", run(tmp, hist + [use("Bash", {"command": cmd})], "Edit", add2), 0)
+        # 14p. review round 2 of #514: segmentation is shell-tokenized, not regex-split.
+        # Major 1: a backslash-continued test run is ONE command, never a free view.
+        for cmd in ["python3 -m pytest \\\n  --rootdir ~/projects/kipi-system -q | tail -20",
+                    "bash q-system/.q-system/verify.sh \\\n  --base origin/main | tail -40"]:
+            check(f"continued test run: {cmd[:24]}", run(tmp, hist + [use("Bash", {"command": cmd})], "Edit", add2), 2)
+        # Major 2: a quoted ; or && is part of the pattern, not a command boundary.
+        for cmd in ["grep -n 'a; b' src/app.py", 'rg "foo && bar" src/x.py', "grep 'a;b' src/x.py",
+                    "grep -n 'x || y' src/app.py"]:
+            check(f"quoted metachar read: {cmd[:24]}", run(tmp, hist + [use("Bash", {"command": cmd})], "Edit", add2), 0)
+        # Unbalanced quotes: one segment, judged whole. A test run in it grants nothing.
+        check("unbalanced quote + test run", run(tmp, hist + [use("Bash", {
+            "command": "cat src/app.py; pytest -q 'oops"})], "Edit", add2), 2)
+        # The chained read still counts after the rewrite (sp-df1f13a5 kept).
+        check("chained read + test run", run(tmp, hist + [use("Bash", {
+            "command": "git diff src/app.py && python3 tests/test_app.py"})], "Edit", add2), 0)
+        # 14l. sp-df1f13a5 nit 4: an internal bug fails open AND names itself on stderr
+        rc, err = run_err(tmp, [[{"type": "user", "message": {"content": 5}}]], "Edit", add1)
+        check("internal error is loud", (rc, len(err.strip().splitlines()), "TypeError" in err), (0, 1, True))
         # 15. no transcript: fail open
         p = subprocess.run([sys.executable, str(HOOK)], input=json.dumps(
             {"tool_name": "Edit", "tool_input": add1, "transcript_path": str(t / "none")}),

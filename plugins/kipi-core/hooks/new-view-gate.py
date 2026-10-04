@@ -33,12 +33,18 @@ cannot prove the look changed the thinking. ANY fresh non-test read satisfies th
 gate, including one unrelated to the problem (sp-e96411d5 item 1, kept on purpose:
 relevance is a judgment no transcript regex can make). A Bash read (cat, sed -n,
 grep, rg, git show ...) counts when it names a non-test path; a test run never
-counts, including a test file run directly (python3 x/test_a.py, bash test-a.sh).
+counts, including a test file run directly (python3 x/test_a.py, bash test-a.sh) and
+a suite runner (verify.sh, run-tests, make test, npm test). A command is judged per
+segment (shell-lexed, split on ; && || & and newlines, quotes and backslash
+continuations respected), so a read chained with a test run counts.
+
+An internal error fails open and prints one line to stderr naming it.
 
 A PAST Write is judged by what Claude Code stored for it: toolUseResult.type
 create|update and originalFile. A rewrite of an existing test file with no new defs
-is then not an addition. When that record is missing (an older transcript, a call
-still pending), the Write to a test file counts as an addition, conservatively.
+is then not an addition, unless it adds check() lines (a check-style file has
+no defs). When that record is missing or its original is empty (an older transcript,
+a call still pending), the Write to a test file counts as an addition, conservatively.
 
 Fails OPEN on missing/unreadable transcript or malformed input: a hook that fails
 closed on its own infrastructure blocks the fix too. Kill switch for the founder's
@@ -52,6 +58,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import sys
 from pathlib import Path
 
@@ -84,11 +91,31 @@ RE_TEST_DEF = re.compile(
     re.MULTILINE,
 )
 
+# A test file in check(...)/assert style has no def to count, so its additions are
+# counted as checks. sp-df1f13a5: the gate's own self-test is this shape.
+# check( only: an assert/expect added inside an existing test is an edit, not a test.
+RE_CHECK = re.compile(r"^\s*check\s*\(", re.MULTILINE)
+
 # A heading or a bold list item only. Prose that starts "Phase 2 ..." in a
 # handoff or PR body is not a new phase (review of #512).
 RE_BASH_READ = re.compile(
     r"(^|[;&|]\s*|\s)(cat|sed\s+-n|head|tail|grep|rg|awk|less|git\s+(show|grep|log|diff))\b")
-RE_TEST_RUN = re.compile(r"\b(pytest|unittest|npm\s+test|go\s+test|cargo\s+test|jest|vitest)\b")
+RE_TEST_RUN = re.compile(
+    r"\b(pytest|unittest|npm\s+test|go\s+test|cargo\s+test|jest|vitest|make\s+test)\b")
+# Suite runners. sp-df1f13a5: `bash q-system/.q-system/verify.sh --changed | tail`
+# named a non-test path and a reader, so running the suite still passed as a view.
+# Matched only in COMMAND position (review of #514): `cat verify.sh` is a read.
+RE_SUITE = re.compile(r"verify\.sh|ci-shaped-run\.sh|run[-_]tests?(\.sh)?")
+# Where a test run writes its output. Review of #514: `pytest > log; tail log` read
+# only the run's own log and was credited as a view once segments were judged apart.
+RE_RUN_OUTPUT = re.compile(r"(?:\d?>>?|\btee(?:\s+-a)?)\s*([^\s;&|<>]+)")
+# A Bash command is judged per segment. sp-df1f13a5: `git diff gate.py && python3
+# test_gate.py` lost the git-diff credit because the whole string was a test run.
+# Segments come from the shell LEXER, not a regex (review round 2 of #514): a regex
+# split was quote-blind (`grep 'a; b' src/x.py` lost its path and was blocked) and
+# treated a backslash-newline as a boundary (a continued pytest run earned a view).
+# Two rounds produced one regex finding each, in opposite directions.
+SEGMENT_SEPS = {";", "&&", "||", "&", ";;"}
 # Running a test FILE directly is a test run too. ASK-2473: `cd repo && python3
 # hooks/test_x.py | tail` named a non-test path (the cd target) and a reader (tail),
 # so run-the-suite-then-add-a-test passed as a view.
@@ -117,6 +144,12 @@ def is_test_run(cmd: str) -> bool:
     """A Bash command that runs tests: a runner, or an interpreter given a test file."""
     if RE_TEST_RUN.search(cmd or ""):
         return True
+    for stage in (cmd or "").split("|"):
+        ws = [w for w in stage.split() if not re.fullmatch(r"\w+=\S*", w)]
+        if ws and (ws[0].rsplit("/", 1)[-1] in INTERPRETERS):
+            ws = [w for w in ws[1:] if not w.startswith("-")]
+        if ws and RE_SUITE.fullmatch(ws[0].rsplit("/", 1)[-1]):
+            return True
     words = re.split(r"[\s;&|()]+", cmd or "")
     for i, w in enumerate(words):
         name = w.rsplit("/", 1)[-1]
@@ -127,6 +160,38 @@ def is_test_run(cmd: str) -> bool:
             if rest and is_test_file(rest[0]):
                 return True
     return False
+
+
+def bash_segments(cmd: str) -> list[str]:
+    """Split a shell command into pipelines on ; && || & and newlines, via shlex.
+
+    A pipe is NOT a split: `python3 test_a.py | tail` is one test run, not a read,
+    and `pytest | tee p.log` must keep its output file inside the test run.
+    Unbalanced quotes: the whole command is one segment, so a test run anywhere in
+    it grants no view (fail toward NOT crediting a look).
+    """
+    text = (cmd or "").replace("\\\n", " ")
+    try:
+        lex = shlex.shlex(text, posix=True, punctuation_chars=";&|()<>\n")
+        lex.whitespace_split = True
+        lex.whitespace = " \t\r"
+        tokens = list(lex)
+    except ValueError:
+        return [cmd or ""]
+    segs, cur = [], []
+    for tok in tokens:
+        bare = tok.replace("\n", "")
+        # A quoted word may hold these chars too; only an all-operator token is one.
+        is_op = bool(tok) and not tok.strip(";&|()<>\n")
+        if is_op and (bare == "" or bare in SEGMENT_SEPS):
+            if cur:
+                segs.append(" ".join(cur))
+            cur = []
+            continue
+        cur.append(bare if is_op else tok)
+    if cur:
+        segs.append(" ".join(cur))
+    return segs or [""]
 
 
 def is_markdown(path: str) -> bool:
@@ -177,11 +242,19 @@ def addition_kind(tool: str, inp: dict, read_disk: bool = True) -> str | None:
             return "test"
         if is_new and new.strip() and is_test_file(path):
             return "test"
-        # A PAST Write cannot be diffed (disk has moved on), and a test file in
-        # check(...) style has no def to count. Found live 2026-10-03: the gate's
-        # own self-test was written that way and did not reset the clock.
+        # Review of #514: check()-style additions were only counted on PAST writes,
+        # so the live gate never blocked them, including this gate's own self-test.
+        if is_test_file(path) and _count(RE_CHECK, new) > _count(RE_CHECK, old):
+            return "test"
+        # A PAST Write cannot be diffed against disk (it has moved on), and a test
+        # file in check(...) style has no def to count. Found live 2026-10-03: the
+        # gate's own self-test was written that way and did not reset the clock.
+        # sp-df1f13a5: #513 skipped this whenever a stored update record existed, so
+        # a rewrite adding three check() lines no longer reset it. With a non-empty
+        # stored original the check() count above decides; with none (missing,
+        # empty), count it.
         if (tool == "Write" and not read_disk and new.strip() and is_test_file(path)
-                and PRIOR_TEXT not in inp):
+                and not inp.get(PRIOR_TEXT)):
             return "test"
     if is_markdown(path) and _count(RE_PHASE, new) > _count(RE_PHASE, old):
         return "phase"
@@ -203,8 +276,13 @@ def view_key(tool: str, inp: dict) -> str | None:
     # shell blocked sessions that had looked. Test runners are not a view.
     if tool == "Bash":
         cmd = inp.get("command", "")
-        if RE_BASH_READ.search(cmd) and not is_test_run(cmd):
-            paths = [w for w in re.findall(r"[\w./~\-]+", cmd) if "/" in w or "." in w]
+        segs = bash_segments(cmd)
+        outputs = {o for seg in segs if is_test_run(seg) for o in RE_RUN_OUTPUT.findall(seg)}
+        for seg in segs:
+            if not RE_BASH_READ.search(seg) or is_test_run(seg):
+                continue
+            paths = [w for w in re.findall(r"[\w./~\-]+", seg)
+                     if ("/" in w or "." in w) and w not in outputs]
             if any(not is_test_path(w) for w in paths):
                 return "bash:" + " ".join(cmd.split())[:200]
     if tool in LOOK_TOOLS:
@@ -313,7 +391,12 @@ def main() -> int:
         if has_new_view(calls):
             return 0
         prior = last_addition(calls) >= 0
-    except Exception:
+    except Exception as exc:
+        # Fail open, but not invisibly. sp-df1f13a5: a bare `return 0` here hid any
+        # internal bug. This line lands in the session's hook output; it is NOT a
+        # fleet alert (a per-call ticket would fire on every write while broken).
+        print(f"new-view-gate: internal error, failing open: {type(exc).__name__}: {exc}",
+              file=sys.stderr)
         return 0
     path = inp.get("file_path") or inp.get("notebook_path") or ""
     # ASK-2473: with no earlier addition, "since the last test was added" was false.
