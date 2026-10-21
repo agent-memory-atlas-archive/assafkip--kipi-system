@@ -334,8 +334,13 @@ install_vendored_hooks() {
   #
   # The installer already prints one precise line per hook. Showing that line is
   # both shorter and true.
-  local _out _rc
-  _out="$(python3 "$installer" 2>&1)"; _rc=$?
+  # `|| _rc=$?`, NEVER `; _rc=$?`. This file runs under `set -euo pipefail`, so
+  # a bare `_out="$(...)"` whose installer exits non-zero kills the whole update
+  # right there: no installer line, no WARNING below, exit 1. The "never fatal"
+  # contract above was dead code. Found 2026-10-21 when a scratch HOME with no
+  # settings.json made the updater die silently before arming any job (ASK-1130).
+  local _out _rc=0
+  _out="$(python3 "$installer" 2>&1)" || _rc=$?
   printf '%s\n' "$_out"
   if [ "$_rc" -ne 0 ]; then
     echo "WARNING: the hook install reported a problem above (exit $_rc). The guard" >&2
@@ -3331,6 +3336,45 @@ if [ -n "$ONLY" ] && [ "$((PASS+FAIL+SKIP))" -eq 0 ]; then
   exit 1
 fi
 
+# ARM NEWLY COMMITTED LAUNCHD JOBS (ASK-1130). Nothing called `kipi install-jobs`,
+# so a merged com.kipi.*.plist ran nowhere until somebody knew to type it: the
+# same shape ASK-729 closed at the installer and left open here. This is the call.
+#
+# It runs `install-plist.sh --missing`, which installs only a template with no job
+# yet and never rewrites or boots out an installed one (see that mode's header),
+# and it runs ONLY when this checkout is the registry's skeleton. That check is the
+# chokepoint, not a nicety: ~15 updater tests run this script from a scratch
+# `git init` tree with the real HOME, and a scratch tree passes install-plist's
+# worktree refusal. Their registries carry no skeleton entry, so they cannot arm a
+# real job pointing at a directory that is deleted a second later. A worktree or a
+# second clone is not the registry's skeleton either, so it cannot rebind a job to
+# itself. Dry runs arm nothing.
+JOBS_NOT_ARMED=""
+arm_new_jobs() {
+  local skeleton here out rc=0
+  # An absent path prints NOTHING, never realpath(""): that is the cwd, which is
+  # this checkout, so a registry with no skeleton entry read as "this is the
+  # skeleton" and armed 15 jobs from a scratch tree (caught by case 5 of the test).
+  skeleton="$(python3 -c 'import json,os,sys; p=(json.load(open(sys.argv[1])).get("skeleton") or {}).get("path") or ""; print(os.path.realpath(p) if p else "")' "$REGISTRY" 2>/dev/null || true)"
+  here="$(cd "$SCRIPT_DIR" && pwd -P)"
+  if [ -z "$skeleton" ] || [ "$here" != "$skeleton" ]; then
+    echo "  jobs: not armed; $here is not the registry skeleton"
+    return 0
+  fi
+  if [ -n "${DRY_RUN:-}" ]; then
+    say "  jobs: not armed (dry run)"
+    return 0
+  fi
+  out="$(bash "$SCRIPT_DIR/q-system/.q-system/scripts/install-plist.sh" --missing 2>&1)" || rc=$?
+  printf '%s\n' "$out" | sed 's/^/  /'
+  if [ "$rc" -ne 0 ]; then
+    JOBS_NOT_ARMED="$(printf '%s\n' "$out" | sed -n 's/^install-jobs: could not install://p')"
+    JOBS_NOT_ARMED="${JOBS_NOT_ARMED:- (install-plist.sh --missing exited $rc)}"
+  fi
+}
+echo "=== Launchd jobs ==="
+arm_new_jobs
+
 # ASK-776. The summary below went to stdout and nothing else: no history, no
 # alert. On 2026-09-23 a read-only audit found 21 of 24 instances syncing and
 # nothing had ever said so. One row per run, appended; this function is the only
@@ -3387,6 +3431,21 @@ fi
 # line 300 of 900 is still, in practice, silent.
 if [ -n "${UNDECLARED:-}" ]; then
   echo "  UNDECLARED NON-PROPAGATING:$UNDECLARED"
+fi
+
+# REPORTED, NEVER FOLDED INTO THE EXIT CODE (ASK-1130 round 3). This script's exit
+# code is the PROPAGATION verdict and its callers read it as exactly that:
+# lessons-daily.sh:124 turns any non-zero into `propagate FAILED`, which bumps the
+# propagation streak, appends a row to the escalations ledger, alerts, and exits 1.
+# A single job whose launchctl bootstrap fails therefore filed a DAILY false alarm
+# about a fleet sync that had succeeded -- and the rollback in install-plist's
+# --missing branch makes that job retry (correctly) on every run, so the false
+# alarm renews itself forever. Arming is a separate concern with its own reporting:
+# the line below names every job, and lessons-daily's own --missing call logs the
+# failure non-fatally on its own channel. UNDECLARED above is reported the same way
+# for the same reason.
+if [ -n "$JOBS_NOT_ARMED" ]; then
+  echo "  LAUNCHD JOBS NOT ARMED:$JOBS_NOT_ARMED"
 fi
 
 [ "$FAIL" -eq 0 ] && [ -z "${GATE_FAIL:-}" ] && exit 0 || exit 1
