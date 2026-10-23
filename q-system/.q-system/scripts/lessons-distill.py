@@ -86,6 +86,23 @@ def new_learnings(instances, ledger):
                 yield name, str(note), h, text
 
 
+def public_instance_label(name):
+    """The instance as a ledger row may name it: one constant, for every instance.
+
+    THE LEDGER SHIPS IN A PUBLIC REPO (ASK-2736, ASK-2058). Its rows used to carry
+    the raw instance name, and instance names include client engagements; the
+    ASK-2058 scrub relabelled 119 rows by hand and this writer would have put a
+    real name back in every new row.
+
+    Not a hash (codex, PR #551 round 2): an unsalted sha1 prefix of a name is
+    reversed by hashing a candidate list, and a stable per-instance label lets
+    rows be grouped by client. Nothing reads the field, so a constant costs
+    nothing. `name` stays in the signature so the call site keeps saying which
+    value is being withheld.
+    """
+    return "redacted"
+
+
 def new_sources(instances, ledger):
     """Every un-ledgered learning: documented failures (RCAs) + non-failure notes."""
     yield from new_rcas(instances, ledger)
@@ -265,7 +282,8 @@ def main():
                 f"source: {held_source_link(path)}\n\n"
                 f"proposed title: {distilled['title']}\n\n{distilled['body']}\n")
             held.append(distilled["title"])
-        row = {"instance": name, "status": "published" if published_text else "held", "date": stamp}
+        row = {"instance": public_instance_label(name),
+               "status": "published" if published_text else "held", "date": stamp}
         if published_text:
             # Provenance: which lesson this source became. Without it the ledger said a source
             # was published but no published lesson traced back to anything (ASK-539).
